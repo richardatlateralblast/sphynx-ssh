@@ -188,7 +188,7 @@ char hostname[HOST_NAME_MAX + 1];
 
 /* defines for the resume function. Need them even if not supported */
 #define HASH_LEN 128               /*40 sha1, 64 blake2s256 128 blake2b512*/
-#define BUF_AND_HASH HASH_LEN + 64 /* length of the hash and other data to get size of buffer */
+#define BUF_AND_HASH (HASH_LEN + 64) /* length of the hash and other data to get size of buffer */
 #define HASH_BUFLEN 8192	   /* 8192 seems to be a good balance between freads
 				    * and the digest func*/
 static void
@@ -1362,58 +1362,73 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
 #if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
 void calculate_hash(char *filename, char *output, off_t length)
 {
-	int n, md_len;
-	EVP_MD_CTX *c;
+	int n, ok = 0;
+	unsigned int md_len = 0;
+	EVP_MD_CTX *c = NULL;
 	const EVP_MD *md;
 	char buf[HASH_BUFLEN];
-	ssize_t bytes;
 	unsigned char out[EVP_MAX_MD_SIZE];
-	char tmp[3];
 	FILE *file_ptr;
-	*output = '\0';
+	size_t want, got;
+
+	/*
+	 * The protocol carries the hash in a fixed-width field, so the output
+	 * is always HASH_LEN characters. On any failure it is HASH_LEN '0'
+	 * characters, which keeps the record the right length and never
+	 * matches a real digest.
+	 */
+	memset(output, '0', HASH_LEN);
+	output[HASH_LEN] = '\0';
 
 	/* open file for calculating hash */
 	file_ptr = fopen(filename, "r");
-	if (file_ptr==NULL)
-	{
-		if (verbose_mode) {
+	if (file_ptr == NULL) {
+		if (verbose_mode)
 			fprintf(stderr, "%s: error opening file %s\n", hostname, filename);
-			/* file the expected output with spaces */
-			snprintf(output, HASH_LEN, "%s",  " ");
-		}
 		return;
 	}
 
-	md = EVP_get_digestbyname("blake2b512");
-	c = EVP_MD_CTX_new();
-	EVP_DigestInit_ex(c, md, NULL);
+	if ((md = EVP_get_digestbyname("blake2b512")) == NULL ||
+	    (c = EVP_MD_CTX_new()) == NULL ||
+	    EVP_DigestInit_ex(c, md, NULL) != 1)
+		goto out;
 
 	while (length > 0) {
-		if (length > HASH_BUFLEN)
-			/* fread returns the number of elements read.
-			 * in this case 1. Multiply by the length to get the bytes */
-			bytes=fread(buf, HASH_BUFLEN, 1, file_ptr) * HASH_BUFLEN;
-		else
-			bytes=fread(buf, length, 1, file_ptr) * length;
-		EVP_DigestUpdate(c, buf, bytes);
-		length -= HASH_BUFLEN;
+		want = length > HASH_BUFLEN ? HASH_BUFLEN : (size_t)length;
+		got = fread(buf, 1, want, file_ptr);
+		/* A short read means the file is shorter than requested, or a
+		 * read error. Either way these bytes cannot be hashed. */
+		if (got != want)
+			goto out;
+		if (EVP_DigestUpdate(c, buf, got) != 1)
+			goto out;
+		length -= got;
 	}
-	EVP_DigestFinal(c, out, &md_len);
-	EVP_MD_CTX_free(c);
+	if (EVP_DigestFinal_ex(c, out, &md_len) != 1 ||
+	    md_len * 2 != HASH_LEN)
+		goto out;
 	/* convert the hash into a string */
-	for(n=0; n < md_len; n++) {
-		snprintf(tmp, 3, "%02x", out[n]);
-		strncat(output, tmp, 3);
-	}
+	for (n = 0; n < (int)md_len; n++)
+		snprintf(output + 2 * n, 3, "%02x", out[n]);
+	ok = 1;
 #ifdef DEBUG
 	fprintf(stderr, "%s: HASH IS '%s' of length %ld\n", hostname, output, strlen(output));
 #endif
+ out:
+	if (!ok) {
+		memset(output, '0', HASH_LEN);
+		output[HASH_LEN] = '\0';
+	}
+	EVP_MD_CTX_free(c);
 	fclose(file_ptr);
 }
 #else
 void calculate_hash(char *filename, char *output, off_t length)
 {
-  /* empty function for builds without openssl or are using libressl */
+	/* Builds without openssl, or with libressl, cannot hash. Keep the
+	 * fixed-width field valid anyway. */
+	memset(output, '0', HASH_LEN);
+	output[HASH_LEN] = '\0';
 }
 #endif /* WITH_OPENSSL */
 
@@ -1519,9 +1534,14 @@ source(int argc, char **argv)
 	size_t insize;
 	unsigned long long ull;
 	char *match; /* used to communicate fragment match */
-	match = "\0"; /*default is to fail the match. NULL and F both indicate fail*/
 
 	for (indx = 0; indx < argc; ++indx) {
+		/*
+		 * The match status belongs to one file. It starts from the "no
+		 * match" default (NULL and F both indicate fail) for every file, or
+		 * a stale M or F from an earlier file is sent for a later one.
+		 */
+		match = "\0";
 		name = argv[indx];
 #ifdef DEBUG
 		fprintf(stderr, "%s index is %d, name is %s\n", hostname, indx, name);
@@ -1595,7 +1615,14 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 		fprintf(stderr, "%s: inbuf length %ld buf length %ld\n", hostname, strlen(inbuf), strlen(buf));
 #endif
 		if (resume_flag) { /* get the hash response from the remote */
-			(void) atomicio(read, remin, inbuf, BUF_AND_HASH - 1);
+			memset(inbuf, 0, sizeof(inbuf));
+			if (atomicio(read, remin, inbuf, BUF_AND_HASH - 1) !=
+			    BUF_AND_HASH - 1) {
+				/* the remote may have sent an error message instead */
+				if (inbuf[0] == '\001' || inbuf[0] == '\002')
+					fatal("%s: remote error: %.100s", name, inbuf + 1);
+				fatal("%s: lost connection reading resume response", name);
+			}
 #ifdef DEBUG
 				fprintf(stderr, "%s: we got '%s' in inbuf length %ld buf was %ld\n",
 					hostname, inbuf, strlen(inbuf), strlen(buf));
@@ -1614,73 +1641,71 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 		if (resume_flag) {
 			cp = inbuf;
 			if (*cp == 'R') { /* resume file transfer*/
-				char *in_hashsum; /* where to hold the incoming hash */
-				in_hashsum = calloc(HASH_LEN+1, sizeof(char));
+				char in_hashsum[HASH_LEN+1]; /* where to hold the incoming hash */
 				for (++cp; cp < inbuf + 5; cp++) {
 					/* skip over the mode */
 				}
-				if (*cp++ != ' ') {
-					fprintf(stderr, "%s: mode not delineated!\n", hostname);
-				}
-
+				/* The response comes from the remote, so check every field. */
+				if (*cp++ != ' ')
+					fatal("%s: mode not delineated in resume response", name);
 				if (!isdigit((unsigned char)*cp))
-					fprintf(stderr, "%s: size not present\n", hostname);
+					fatal("%s: size not present in resume response", name);
 				ull = strtoull(cp, &cp, 10);
 				if (!cp || *cp++ != ' ')
-					fprintf(stderr, "%s: size not delimited\n", hostname);
-				if (TYPE_OVERFLOW(off_t, ull))
-					fprintf(stderr, "%s: size out of range\n", hostname);
-				insize = (off_t)ull;
-
-#ifdef DEBUG
-				fprintf (stderr, "%s: received size of %ld\n", hostname, insize);
-#endif
-
-				/* copy the cp pointer byte by byte */
-				int i;
-				for (i = 0; i < HASH_LEN; i++) {
-					strncat(in_hashsum, cp++, 1);
-				}
+					fatal("%s: size not delimited in resume response", name);
+				if (strnlen(cp, HASH_LEN) < HASH_LEN)
+					fatal("%s: hash too short in resume response", name);
+				memcpy(in_hashsum, cp, HASH_LEN);
+				in_hashsum[HASH_LEN] = '\0';
+				cp += HASH_LEN;
 #ifdef DEBUG
 				fprintf (stderr, "%s: in_hashsum '%s'\n", hostname, in_hashsum);
 #endif
-
-				/*get the hash of the source file to the byte length we just got*/
-				calculate_hash(name, test_hashsum, insize);
-#ifdef DEBUG
-				fprintf(stderr, "%s: calculated hashsum of local %s to %ld is %s\n",
-					hostname, last, insize, test_hashsum);
-#endif
-				/* compare the incoming hash to the hash of the local file*/
-				if (strcmp(in_hashsum, test_hashsum) == 0) {
-					/* the fragments match so we should seek to the appropriate place in the
-					 * local file and set the remote file to append */
-#ifdef DEBUG
-					fprintf(stderr, "%s: File fragments match\n", hostname);
-					fprintf(stderr, "%s: seeking to %ld\n", hostname, insize);
-#endif
-					xfer_size = stb.st_size - insize;
-#ifdef DEBUG
-					fprintf(stderr, "%s: xfer_size: %ld, stb.st_size: %ld insize: %ld\n",
-						hostname, xfer_size, stb.st_size, insize);
-#endif
-					if (lseek(fd, insize, SEEK_CUR) != (off_t)insize) {
-#ifdef DEBUG
-						fprintf(stderr, "%s: lseek did not return %ld\n", hostname, insize) ;
-#endif
-						goto next;
-					}
-					match = "M";
-				} else {
-					/* the fragments don't match so we should start over from the begining */
-#ifdef DEBUG
-					fprintf(stderr, "%s: File fragments do not match '%s'(in) '%s'(local)\n",
-				       		hostname, in_hashsum, test_hashsum);
-#endif
+				if (TYPE_OVERFLOW(off_t, ull) || (off_t)ull > stb.st_size) {
+					/*
+					 * The remote claims to have more than this file holds,
+					 * or the size is nonsense. The fragments cannot match,
+					 * so send the whole file again.
+					 */
 					match = "F";
 					xfer_size = stb.st_size;
+				} else {
+					insize = (size_t)ull;
+#ifdef DEBUG
+					fprintf (stderr, "%s: received size of %ld\n", hostname, insize);
+#endif
+					/*get the hash of the source file to the byte length we just got*/
+					calculate_hash(name, test_hashsum, insize);
+#ifdef DEBUG
+					fprintf(stderr, "%s: calculated hashsum of local %s to %ld is %s\n",
+						hostname, last, insize, test_hashsum);
+#endif
+					/* compare the incoming hash to the hash of the local file*/
+					if (strcmp(in_hashsum, test_hashsum) == 0) {
+						/* the fragments match so we should seek to the appropriate place in the
+						 * local file and set the remote file to append */
+#ifdef DEBUG
+						fprintf(stderr, "%s: File fragments match\n", hostname);
+						fprintf(stderr, "%s: seeking to %ld\n", hostname, insize);
+#endif
+						xfer_size = stb.st_size - insize;
+						if (lseek(fd, insize, SEEK_CUR) != (off_t)insize) {
+#ifdef DEBUG
+							fprintf(stderr, "%s: lseek did not return %ld\n", hostname, insize) ;
+#endif
+							goto next;
+						}
+						match = "M";
+					} else {
+						/* the fragments don't match so we should start over from the begining */
+#ifdef DEBUG
+						fprintf(stderr, "%s: File fragments do not match '%s'(in) '%s'(local)\n",
+							hostname, in_hashsum, test_hashsum);
+#endif
+						match = "F";
+						xfer_size = stb.st_size;
+					}
 				}
-				free(in_hashsum);
 			}
 			if (*cp == 'S') { /* skip file */
 #ifdef DEBUG
@@ -1922,7 +1947,7 @@ void
 sink(int argc, char **argv, const char *src)
 {
 	static BUF buffer;
-	struct stat stb, cpstat, npstat;
+	struct stat stb, npstat;
 	BUF *bp;
 	off_t i;
 	size_t j, count;
@@ -1931,7 +1956,7 @@ sink(int argc, char **argv, const char *src)
 	off_t size, statbytes, xfer_size;
 	unsigned long long ull;
 	int setimes, targisdir, wrerr;
-	char ch, *cp, *np, *np_tmp, *targ, *why, *vect[1], buf[16384], visbuf[16384];
+	char ch, *cp, *np, *np_tmp, *np_rand, *targ, *why, *vect[1], buf[16384], visbuf[16384];
 	char **patterns = NULL;
 	size_t n, npatterns = 0;
 	struct timeval tv[2];
@@ -1943,6 +1968,7 @@ sink(int argc, char **argv, const char *src)
 	int bad_match_flag = 0;
 	np = NULL; /* this was originally '/0' but that's wrong */
 	np_tmp = NULL;
+	np_rand = NULL;
 
 
 #define	atime	tv[0]
@@ -1990,6 +2016,15 @@ sink(int argc, char **argv, const char *src)
 
 	for (first = 1;; first = 0) {
 		bad_match_flag = 0; /* used in resume mode. */
+		/*
+		 * Resume state belongs to one file. Release the previous file's
+		 * names here, so that every path through the loop, including the
+		 * early continues, starts clean.
+		 */
+		free(np_tmp);
+		np_tmp = NULL;
+		free(np_rand);
+		np_rand = NULL;
 #ifdef DEBUG
 		fprintf(stderr, "%s: At start of loop buf is %s\n", hostname, buf);
 #endif
@@ -2129,15 +2164,20 @@ sink(int argc, char **argv, const char *src)
 		fprintf(stderr, "%s: cp is %s\n", hostname, cp);
 #endif
 		if (resume_flag && !dir_flag) {
-			*remote_hashsum = '\0';
-			int i;
-			for (i = 0; i < HASH_LEN; i++) {
-				strncat (remote_hashsum, cp++, 1);
-			}
+			/*
+			 * The hash is a fixed-width field followed by a space and the
+			 * filename. Check that it is all there before reading it, so a
+			 * short line cannot make us read past the end of the record.
+			 */
+			if (strnlen(cp, HASH_LEN + 1) < HASH_LEN + 1)
+				SCREWUP("hash too short");
+			memcpy(remote_hashsum, cp, HASH_LEN);
+			remote_hashsum[HASH_LEN] = '\0';
+			cp += HASH_LEN;
 #ifdef DEBUG
 			fprintf (stderr, "%s: '%s'\n", hostname, remote_hashsum);
 #endif
-			if (!cp || *cp++ != ' ')
+			if (*cp++ != ' ')
 				SCREWUP("hash not delimited");
 		}
 #ifdef DEBUG
@@ -2216,12 +2256,14 @@ sink(int argc, char **argv, const char *src)
 		}
 		omode = mode;
 		mode |= S_IWUSR;
-		stat(cp, &cpstat);
 		xfer_size = size;
 		if (resume_flag) {
 #ifdef DEBUG
 			fprintf(stderr, "%s: np is %s\n", hostname, np);
 #endif
+			/* Start from a known state: stat() below leaves it untouched on
+			 * failure, and the mode is sent to the peer. */
+			memset(&npstat, 0, sizeof(npstat));
 			/* does the file exist and if it does it writable? */
 			if (stat(np, &npstat) == -1) {
 #ifdef DEBUG
@@ -2313,10 +2355,16 @@ sink(int argc, char **argv, const char *src)
 				xfer_size = size - npstat.st_size;
 				resume_flag = 1;
 				np_tmp = xstrdup(np);
-				/* We should have a random component to avoid clobbering a
-				 * local file */
+				/*
+				 * The data is received into a temporary file with a random
+				 * component in its name, so a local file is not clobbered.
+				 * The name is built in its own buffer: np may point at the
+				 * caller's argument string or at the shared directory name
+				 * buffer, and neither has room to grow.
+				 */
 				rand_str(rand_string, 8);
-				strcat(np, rand_string);
+				xasprintf(&np_rand, "%s%s", np_tmp, rand_string);
+				np = np_rand;
 #ifdef DEBUG
 				fprintf(stderr, "%s: Will concat %s to %s after xfer\n",
 					hostname, np, np_tmp);
@@ -2368,9 +2416,8 @@ sink(int argc, char **argv, const char *src)
 #endif
 					if (np_tmp != NULL)
 						np = np_tmp;
-					else {
-						continue;
-					}
+					else
+						SCREWUP("unexpected resume match status");
 				} else {
 #ifdef DEBUG
 					fprintf(stderr, "%s: match received is NULL\n", hostname);
@@ -2389,7 +2436,8 @@ sink(int argc, char **argv, const char *src)
 		fprintf(stderr, "%s: Creating file. mode is %d for %s\n",
 			hostname, mode, np);
 #endif
-		if ((ofd = open(np, O_WRONLY|O_CREAT, mode)) == -1) {
+		/* the temporary resume file must be new: never follow or reuse an existing name */
+		if ((ofd = open(np, O_WRONLY|O_CREAT|(np == np_rand ? O_EXCL : 0), mode)) == -1) {
 bad:			run_err("%s: %s", np, strerror(errno));
 			continue;
 		}
@@ -2474,66 +2522,72 @@ bad:			run_err("%s: %s", np, strerror(errno));
 			 hostname, resume_flag, np_tmp, bad_match_flag);
 #endif
 		if (resume_flag && np_tmp && !bad_match_flag) {
-			FILE *orig, *resume;
+			FILE *orig = NULL, *resume = NULL;
 			char res_buf[512]; /* set at 512 just because, might want to increase*/
-			ssize_t res_bytes = 0;
-			off_t sum = 0;
-			struct stat res_stat;
-			*res_buf = '\0';
-			orig = NULL; /*supress warnings*/
-			resume = NULL; /*supress warnings*/
+			size_t res_bytes;
+			int cat_ok = 0;
 #ifdef DEBUG
 			fprintf(stderr, "%s: Resume flag is set. Going to concat %s to %s  now\n",
 				hostname, np, np_tmp);
 #endif
-			/* np/ofd is the resume file so open np_tmp for appending
-			 * close ofd because we are going to be shifting it
-			 * and I don't wnat the same file open in multiple descriptors */
+			/*
+			 * np is the temporary file holding the new tail. Append it to
+			 * the existing file (np_tmp) and then remove it. Close ofd first
+			 * so the same file is not open through two descriptors.
+			 */
 			if (close(ofd) == -1)
 				note_err("%s: close: %s", np, strerror(errno));
-			/* orig is the target file, resume is the temp file */
-			orig = fopen(np_tmp, "a"); /*open for appending*/
-			if (orig == NULL) {
-				fprintf(stderr, "%s: Could not open %s for appending.", hostname, np_tmp);
-				goto stopcat;
+			ofd = -1;
+			if (wrerr) {
+				/*
+				 * The tail was not written completely. Appending it would
+				 * corrupt the existing file, so leave that alone. The error
+				 * has already been recorded.
+				 */
+			} else if ((orig = fopen(np_tmp, "a")) == NULL) {
+				note_err("%s: could not open for appending: %s",
+				    np_tmp, strerror(errno));
+			} else if ((resume = fopen(np, "r")) == NULL) {
+				note_err("%s: could not open for reading: %s",
+				    np, strerror(errno));
+			} else {
+				cat_ok = 1;
+				while ((res_bytes = fread(res_buf, 1, sizeof(res_buf),
+				    resume)) > 0) {
+					if (fwrite(res_buf, 1, res_bytes, orig) != res_bytes) {
+						note_err("%s: append: %s", np_tmp,
+						    strerror(errno));
+						cat_ok = 0;
+						break;
+					}
+				}
+				if (cat_ok && ferror(resume)) {
+					note_err("%s: read: %s", np, strerror(errno));
+					cat_ok = 0;
+				}
 			}
-			resume = fopen(np, "r"); /*open for reading only*/
-			if (resume == NULL) {
-				fprintf(stderr, "%s: Could not open %s for reading.", hostname, np);
-				goto stopcat;
-			}
-			/* get the number of bytes in the temp file*/
-			if (fstat(fileno(resume), &res_stat) == -1) {
-				fprintf(stderr, "%s: Could not stat %s", hostname, np);
-				goto stopcat;
-			}
-			/* while the number of bytes read from the temp file
-			 * is less than the size of the file read in a chunk and
-			 * write it to the target file */
-			do {
-				res_bytes = fread(res_buf, 1, 512, resume);
-				fwrite(res_buf, 1, res_bytes, orig);
-				sum += res_bytes;
-			} while (sum < res_stat.st_size);
-
-stopcat:		if (orig)
-				fclose(orig);
-			if (resume)
+			if (resume != NULL)
 				fclose(resume);
-			/* delete the resume file */
+			if (orig != NULL && fclose(orig) != 0 && cat_ok) {
+				note_err("%s: close: %s", np_tmp, strerror(errno));
+				cat_ok = 0;
+			}
+			if (orig != NULL && !cat_ok) {
+				/* put the existing file back to the length it had */
+				if (truncate(np_tmp, npstat.st_size) != 0)
+					note_err("%s: restore: %s", np_tmp,
+					    strerror(errno));
+			}
+			/* delete the temporary file */
 			remove(np);
 #ifdef DEBUG
 			fprintf (stderr, "%s: np(%s) and np_tmp(%s)\n", hostname, np, np_tmp);
 #endif
 			np = np_tmp;
-#ifdef DEBUG
-			fprintf (stderr, "%s np(%s) and np_tmp(%s)\n", hostname, np, np_tmp);
-#endif
-			/* reset ofd to the original np */
+			/* reopen the existing file so its mode can be set below */
 			if ((ofd = open(np_tmp, O_WRONLY)) == -1) {
-				fprintf(stderr, "%s: couldn't open %s in append function\n", hostname, np_tmp);
-				atomicio(vwrite, remout, "", 1);
-				goto bad;
+				note_err("%s: %s", np_tmp, strerror(errno));
+				goto modes_done;
 			}
 		}
 		if (pflag) {
@@ -2559,6 +2613,7 @@ stopcat:		if (orig)
 		}
 		if (close(ofd) == -1)
 			note_err("%s: close: %s", np, strerror(errno));
+modes_done:
 		(void) response();
 		if (showprogress)
 			stop_progress_meter();
@@ -2575,13 +2630,10 @@ stopcat:		if (orig)
 			fprintf (stderr, "%s: Sending null to remout.\n", hostname);
 #endif
 			(void) atomicio(vwrite, remout, "", 1); }
-		/* we are in resume mode and we have allocated memory for np_tmp */
-		if (resume_flag && np_tmp != NULL) {
-			free(np_tmp);
-			np_tmp = NULL;
-		}
         }
 done:
+	free(np_tmp);
+	free(np_rand);
 	for (n = 0; n < npatterns; n++)
 		free(patterns[n]);
 	free(patterns);
@@ -2887,7 +2939,7 @@ void rand_str(char *dest, size_t length) {
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 	while (length-- > 0) {
-		size_t index = (double) rand() / RAND_MAX * (sizeof charset - 1);
+		size_t index = arc4random_uniform(sizeof charset - 1);
 		*dest++ = charset[index];
 	}
 	*dest = '\0';

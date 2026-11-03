@@ -1428,6 +1428,24 @@ channel_tcpwinsz(struct ssh *ssh)
 	return (tcpwinsz);
 }
 
+/*
+ * Can the channel read more into c->input?
+ *
+ * This has to agree with channel_handle_rfd(), which only reads when
+ * sshbuf_avail() is non-zero. For channel input buffers sshbuf_avail() keeps
+ * headroom (about 1/21 of the buffer) that sshbuf_check_reserve() knows
+ * nothing about. Checking only sshbuf_check_reserve() therefore arms the poll
+ * for a read that then does nothing when the buffer is in that headroom:
+ * ppoll() returns at once because the fd is readable, the read is skipped,
+ * and the loop spins at full CPU until the output side drains the buffer.
+ */
+static int
+channel_input_can_read(Channel *c)
+{
+	return sshbuf_check_reserve(c->input, CHAN_RBUF) == 0 &&
+	    sshbuf_avail(c->input) > 0;
+}
+
 static void
 channel_pre_open(struct ssh *ssh, Channel *c)
 {
@@ -1435,7 +1453,7 @@ channel_pre_open(struct ssh *ssh, Channel *c)
 	if (c->istate == CHAN_INPUT_OPEN &&
 	    c->remote_window > 0 &&
 	    sshbuf_len(c->input) < c->remote_window &&
-	    sshbuf_check_reserve(c->input, CHAN_RBUF) == 0)
+	    channel_input_can_read(c))
 		c->io_want |= SSH_CHAN_IO_RFD;
 	if (c->ostate == CHAN_OUTPUT_OPEN ||
 	    c->ostate == CHAN_OUTPUT_WAIT_DRAIN) {
@@ -1597,7 +1615,7 @@ channel_pre_mux_client(struct ssh *ssh, Channel *c)
 {
 	c->io_want = 0;
 	if (c->istate == CHAN_INPUT_OPEN && !c->mux_pause &&
-	    sshbuf_check_reserve(c->input, CHAN_RBUF) == 0)
+	    channel_input_can_read(c))
 		c->io_want |= SSH_CHAN_IO_RFD;
 	if (c->istate == CHAN_INPUT_WAIT_DRAIN) {
 		/* clear buffer immediately (discard any partial packet) */

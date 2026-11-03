@@ -812,39 +812,40 @@ kex_free(struct kex *kex)
 char *
 patch_list(char * orig)
 {
-	char * adj = xstrdup(orig);
-	char * match;
-	u_int next;
-
 	const char * ccpstr = "chacha20-poly1305@openssh.com";
 	const char * ccpmtstr = "chacha20-poly1305-mt@hpnssh.org";
+	size_t mtlen = strlen(ccpmtstr);
+	const char *p, *end, *mt_end = NULL;
+	char *match, *adj;
+	size_t off;
 
-	match = match_list(ccpmtstr, orig, &next);
-	if (match != NULL) { /* CC20-MT found in the list */
-		free(match);
-		match = match_list(ccpstr, orig, NULL);
-		if (match == NULL) { /* CC20-Serial NOT found in the list */
-			adj = xreallocarray(adj,
-			    strlen(adj) /* original string length */
-			    + 1 /* for the original null-terminator */
-			    + strlen(ccpstr) /* make room for ccpstr */
-			    + 1 /* make room for the comma delimiter */
-			    , sizeof(char));
-			/*
-			 * adj[next] points to the character after the CC20-MT
-			 * string. adj[next] might be ',' or '\0' at this point.
-			 */
-			adj[next] = ',';
-			/* adj + next + 1 is the character after that comma */
-			memcpy(adj + next + 1, ccpstr, strlen(ccpstr));
-			/* rewrite the rest of the original list */
-			memcpy(adj + next + 1 + strlen(ccpstr), orig + next,
-			    strlen(orig + next) + 1);
-		} else { /* CC20-Serial found in the list, nothing to do */
-			free(match);
+	/*
+	 * Find the CC20-MT cipher as a whole entry of the list and note where
+	 * that entry ends. The position has to come from this list: the
+	 * offset match_list() reports is into the string being searched for,
+	 * not into the list, and is only the right place by coincidence when
+	 * the CC20-MT cipher is the first entry.
+	 */
+	for (p = orig; *p != '\0'; p = (*end == ',') ? end + 1 : end) {
+		end = p + strcspn(p, ",");
+		if ((size_t)(end - p) == mtlen &&
+		    strncmp(p, ccpmtstr, mtlen) == 0) {
+			mt_end = end;
+			break;
 		}
 	}
+	if (mt_end == NULL) /* CC20-MT not in the list: nothing to add */
+		return xstrdup(orig);
 
+	if ((match = match_list(ccpstr, orig, NULL)) != NULL) {
+		/* CC20-Serial found in the list, nothing to do */
+		free(match);
+		return xstrdup(orig);
+	}
+
+	/* CC20-Serial NOT found: insert it straight after CC20-MT */
+	off = mt_end - orig;
+	xasprintf(&adj, "%.*s,%s%s", (int)off, orig, ccpstr, orig + off);
 	return adj;
 }
 

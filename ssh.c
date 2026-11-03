@@ -878,6 +878,13 @@ main(int ac, char **av)
 				options.request_tty = REQUEST_TTY_FORCE;
 			else
 				options.request_tty = REQUEST_TTY_YES;
+			/*
+			 * ensure that the user doesn't try to backdoor a null cipher
+			 * switch on an interactive session, so explicitly disable it
+			 * no matter what. (-T asks for no tty, which is the case the
+			 * none cipher is allowed in, so it must not disable it.)
+			 */
+			options.none_switch = 0;
 			break;
 		case 'v':
 			if (debug_flag == 0) {
@@ -1036,10 +1043,6 @@ main(int ac, char **av)
 			break;
 		case 'T':
 			options.request_tty = REQUEST_TTY_NO;
-			/* ensure that the user doesn't try to backdoor a */
-			/* null cipher switch on an interactive session */
-			/* so explicitly disable it no matter what */
-			options.none_switch=0;
 			break;
 		case 'o':
 			line = xstrdup(optarg);

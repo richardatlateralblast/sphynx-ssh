@@ -1,3 +1,11 @@
+# sphynx-ssh
+
+sphynx-ssh is a fork of [HPN-SSH](https://github.com/rapier1/hpn-ssh) used as the source for the sphynx wrapper, which builds and packages it for target systems. Its version string is `OpenSSH_<base>_hpn<version>_sphynx<version>`, set in `version.h`. Upstream OpenSSH and HPN-SSH documentation is below, unchanged except where noted.
+
+Continuous integration runs `c-cpp.yml` on pushes and pull requests to `master`, and `vm.yml` on pushes that change source files. The tests are the OpenSSH regression suite (`make tests`).
+
+---
+
 # HPNSSH: Based on Portable OpenSSH
 HPN-SSH is a high performance soft fork of OpenSSH that can provide significantly faster throughput for bulk data transfers over a wide range of network paths. In some situations we've seen throughput rates more than 100 times faster than OpenSSH. HPN-SSH is able to do this by optimizing the application layer receive buffer to match the TCP receive buffer. Notably, to see performance improvements HPN-SSH only needs to be the data receiver so users can see notable improvements with many other SSH implementations. HPN-SSH also incorporates two parallelized ciphers, AES-CTR and Chacha20 (the default). When using these ciphers a throughput performance increase of 30% is typical. More information on how we do this work and other features of HPN-SSH is available from [https://hpnssh.org](https://hpnssh.org).
 

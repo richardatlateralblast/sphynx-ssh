@@ -541,6 +541,18 @@ int
 chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
     const u_char *src, u_int len, u_int aadlen, u_int authlen, int do_encrypt)
 {
+	/*
+	 * The keystream for a packet is pregenerated: headerStream holds
+	 * CHACHA_BLOCKLEN bytes and mainStream holds KEYSTREAMLEN bytes. len and
+	 * aadlen come from the packet, and a larger value would read past them
+	 * into the neighbouring keystream state. Refuse it, before anything else.
+	 */
+	if (aadlen > CHACHA_BLOCKLEN || len > KEYSTREAMLEN) {
+		debug_f("packet too large for the pregenerated keystream: "
+		    "len %u aadlen %u", len, aadlen);
+		return SSH_ERR_INVALID_ARGUMENT;
+	}
+
 #ifdef SAFETY
 	if (ctx_mt->mainpid != getpid()) { /* we're a fork */
 		/*

@@ -2993,37 +2993,33 @@ client_session2_setup(struct ssh *ssh, int id, int want_tty, int want_subsystem,
 		 * scp commands to look for hpnscp instead.
 		 */
 		if (ssh->compat & SSH_HPNSSH_PREFIX) {
-			char *new_cmd;
-			new_cmd = malloc(len+4);
-			/* read the existing command into a temp buffer */
-			sprintf(new_cmd, "%s", (const u_char*)sshbuf_ptr(cmd));
-			const char *pos;
-			/* see if the command starts with scp */
-			pos = strstr(new_cmd, "scp");
-			/* by substracting the pointer new_cmd from the pointer
-			 * pos we end up with the position of the needle in the
-			 * haystack. If it's 0 then we can mess with it
+			char *old_cmd;
+
+			/*
+			 * Take a NUL-terminated copy: the buffer's contents are not
+			 * guaranteed to be terminated.
 			 */
-			if (pos - new_cmd == 0) {
+			if ((old_cmd = sshbuf_dup_string(cmd)) == NULL)
+				fatal_f("sshbuf_dup_string failed");
+			/* see if the command starts with scp */
+			if (strncmp(old_cmd, "scp", 3) == 0) {
 				debug_f("Rewriting scp command for hpnscp.");
-				sprintf(new_cmd, "hpn%s", (const u_char*)sshbuf_ptr(cmd));
-				debug_f("Command was: %s and is now %s",
-				      (const u_char*)sshbuf_ptr(cmd), new_cmd);
-				/* free the existing sshbuf 'cmd'
-				 * recreate it and then write our new_cmd into
-				 * the sshbuf struct
+				/*
+				 * cmd belongs to the caller, which uses it again and
+				 * frees it later, so change its contents in place. Do
+				 * not free it or replace the pointer: that would leave
+				 * the caller with a dangling pointer.
 				 */
-				sshbuf_free(cmd);
-				if ((cmd = sshbuf_new()) == NULL)
-					fatal("sshbuf_new failed in scp rewrite");
-				sshbuf_putf(cmd, "%s", new_cmd);
-				/* we use len later on so don't forget to
-				 * increment it by the number of new chars in the
-				 * command
-				 */
-				len += 3;
-				free(new_cmd);
+				sshbuf_reset(cmd);
+				if ((r = sshbuf_putf(cmd, "hpn%s", old_cmd)) != 0)
+					fatal_fr(r, "rewrite scp command");
+				debug_f("Command was: %s and is now %.*s", old_cmd,
+				    (int)sshbuf_len(cmd),
+				    (const char *)sshbuf_ptr(cmd));
+				/* len is used later, so follow the new length */
+				len = sshbuf_len(cmd);
 			}
+			free(old_cmd);
 		}
 		if ((cmdstring = sshbuf_dup_string(cmd)) == NULL)
 			fatal_f("sshbuf_dup_string failed");
