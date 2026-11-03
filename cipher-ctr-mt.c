@@ -74,18 +74,9 @@
 #define MAX_THREADS      4
 #define MAX_NUMKQ        (MAX_THREADS + 1)
 
-/* Number of pregen threads to use */
-/* this is a default value. The actual number is
- * determined during init as a function of the number
- * of available cores */
-int cipher_threads = 1;
-
-/* Number of keystream queues */
-/* ideally this should be large enough so that there is
- * always a key queue for a thread to work on
- * so maybe double of the number of threads. Again this
- * is a default and the actual value is determined in init*/
-int numkq = 2;
+/* The number of pregen threads and keystream queues is chosen for each
+ * cipher context in ssh_aes_ctr_init (SSH_CIPHER_THREADS). They are kept
+ * in the context, not in globals. */
 
 /* Length of a keystream queue */
 /* one queue holds 512KB (1024 * 32 * 16) of key data
@@ -136,43 +127,52 @@ struct kq {
 	u_char          pad1[CACHELINE_LEN];
 };
 
-/* Context struct */
+/* Context struct. Everything a pregen thread needs is in here, so no
+ * state is shared between contexts through globals. */
+struct ssh_aes_ctr_ctx_mt;
+
+/* Arguments for one pregen thread. Embedded in the context, so it lives as
+ * long as the context does and the thread can read it safely. */
+struct pregen_job {
+	struct ssh_aes_ctr_ctx_mt *ctx;
+	int                        idx;
+};
+
 struct ssh_aes_ctr_ctx_mt
 {
 	long unsigned int struct_id;
-	int               keylen;
-	int		  state;
-	int		  qidx;
-	int		  ridx;
-	int               id[MAX_THREADS]; /* 32 */
-	AES_KEY           aes_key;
-	const u_char     *orig_key;
-	u_char		  aes_counter[AES_BLOCK_SIZE]; /* 16B */
-	pthread_t	  tid[MAX_THREADS]; /* 32 */
-	pthread_rwlock_t  tid_lock;
-	struct kq	  q[MAX_NUMKQ]; /* 33 */
+	int keylen;      /* key length in bits */
+	int threads;     /* pregen threads to start */
+	int numkq;       /* keystream queues: threads + 1 */
+	int running;     /* threads started and not yet joined */
+	int state;
+	int qidx;
+	int ridx;
+	int id[MAX_THREADS]; /* 32 */
+	AES_KEY aes_key;
+	/* Copy of the key. The caller's buffer is not guaranteed to outlive
+	 * the init call, and the pregen threads read the key. */
+	u_char key[32];
+	u_char aes_counter[AES_BLOCK_SIZE]; /* 16B */
+	pthread_t tid[MAX_THREADS]; /* 32 */
+	/* Per-thread keystream contexts. Created and keyed before their thread
+	 * starts; freed by stop_and_join after the thread has been joined. */
+	EVP_CIPHER_CTX *evp[MAX_THREADS];
+	struct pregen_job job[MAX_THREADS];
+	struct kq q[MAX_NUMKQ]; /* 33 */
 #ifdef __APPLE__
-	pthread_rwlock_t  stop_lock;
-	int		  exit_flag;
+	pthread_rwlock_t stop_lock;
+	int exit_flag;
 #endif /* __APPLE__ */
-};
-
-/* this defines the hash and elements of evp context pointers
- * that are created in thread_loop. We use this to clear and
- * free the contexts in stop_and_prejoin
- */
-struct aes_mt_ctx_ptrs {
-	pthread_t       tid;
-	EVP_CIPHER_CTX *pointer; /* 32 */
-	UT_hash_handle hh;
 };
 
 /* globals */
 /* how we increment the id the structs we create */
 long unsigned int global_struct_id = 0;
 
-/* keep a copy of the pointers created in thread_loop to free later */
-struct aes_mt_ctx_ptrs *evp_ptrs = NULL;
+/* An all-zero block of input for the keystream generator. It is only read,
+ * so it is static rather than a 512KB array on each thread's stack. */
+static const u_char mynull[KQLEN * AES_BLOCK_SIZE];
 
 /*
  * Add num to counter 'ctr'
@@ -237,35 +237,28 @@ stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
 	pthread_rwlock_unlock(&c->stop_lock);
 #endif /* __APPLE__ */
 
-	/* Cancel pregen threads */
-	for (i = 0; i < cipher_threads; i++) {
-		debug ("Canceled %lu (%lu,%d)", c->tid[i], c->struct_id, c->id[i]);
-		pthread_cancel(c->tid[i]);
+	/* Wake anything parked in pthread_cond_wait() so it rechecks the exit
+	 * condition. Without this a parked thread can only be removed by
+	 * pthread_cancel(), which leaves the join below blocked if that cancel
+	 * is not delivered. */
+	for (i = 0; i < c->numkq; i++) {
+		pthread_mutex_lock(&c->q[i].lock);
+		pthread_cond_broadcast(&c->q[i].cond);
+		pthread_mutex_unlock(&c->q[i].lock);
 	}
-        for (i = 0; i < numkq; i++) {
-                pthread_mutex_lock(&c->q[i].lock);
-                pthread_cond_broadcast(&c->q[i].cond);
-                pthread_mutex_unlock(&c->q[i].lock);
-        }
-	for (i = 0; i < cipher_threads; i++) {
-		if (pthread_kill(c->tid[i], 0) != 0)
-			debug3("AES-CTR MT pthread_join failure: Invalid thread id %lu in %s",
-			       c->tid[i], __FUNCTION__);
-		else {
-			debug ("Joining %lu (%lu, %d)", c->tid[i], c->struct_id, c->id[i]);
-			pthread_mutex_destroy(&c->q[i].lock);
-                        pthread_cond_destroy(&c->q[i].cond);
-                        pthread_join(c->tid[i], NULL);
-			/* this finds the entry in the hash that corresponding to the
-			 * thread id. That's used to find the pointer to the cipher struct
-			 * created in thread_loop. */
-			struct aes_mt_ctx_ptrs *ptr;
-			HASH_FIND_INT(evp_ptrs, &c->tid[i], ptr);
-			EVP_CIPHER_CTX_free(ptr->pointer);
-			HASH_DEL(evp_ptrs, ptr);
-			free(ptr);              }
-        }
-	pthread_rwlock_destroy(&c->tid_lock);
+
+	/* Cancel only the threads that were actually started */
+	for (i = 0; i < c->running; i++)
+		pthread_cancel(c->tid[i]);
+
+	/* Join each thread, then free its keystream context. Once joined, a
+	 * thread can no longer touch its context or the queue locks. */
+	for (i = 0; i < c->running; i++) {
+		pthread_join(c->tid[i], NULL);
+		EVP_CIPHER_CTX_free(c->evp[i]);
+		c->evp[i] = NULL;
+	}
+	c->running = 0;
 }
 
 /*
@@ -283,70 +276,36 @@ stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
  * each counter increment. Turns out not to be the case -cjr 10/15/21*/
 
 static void *
-thread_loop(void *x)
+thread_loop(void *arg)
 {
-	EVP_CIPHER_CTX * volatile aesni_ctx;
-	struct ssh_aes_ctr_ctx_mt *c = x;
+	struct pregen_job *job = arg;
+	struct ssh_aes_ctr_ctx_mt *c = job->ctx;
+	/* this thread's keystream context, created and keyed by the parent */
+	EVP_CIPHER_CTX *evp_ctx = c->evp[job->idx];
 	struct kq *q;
-	struct aes_mt_ctx_ptrs *ptr;
-	int qidx;
-	pthread_t first_tid;
 	int outlen;
-	u_char mynull[KQLEN * AES_BLOCK_SIZE];
-	memset(&mynull, 0, KQLEN * AES_BLOCK_SIZE);
-
-	/* get the thread id to see if this is the first one */
-	pthread_rwlock_rdlock(&c->tid_lock);
-	first_tid = c->tid[0];
-	pthread_rwlock_unlock(&c->tid_lock);
-
-	/* create the context for this thread */
-	aesni_ctx = EVP_CIPHER_CTX_new();
-
-	/* keep track of the pointer for the evp in this struct
-	 * so we can free it later. So we place it in a hash indexed on the
-	 * thread id, which is available to us in the free function.
-	 * Note, the thread id isn't necessary unique across rekeys but
-	 * that's okay as they are unique during a key. */
-	ptr = malloc(sizeof *ptr); /*freed in stop & prejoin */
-	ptr->tid = pthread_self(); /* index for hash */
-	ptr->pointer = aesni_ctx;
-	HASH_ADD_INT(evp_ptrs, tid, ptr);
-
-	/* initialize the cipher ctx with the key provided
-	 * determine which cipher to use based on the key size */
-	if (c->keylen == 256)
-		EVP_EncryptInit_ex(aesni_ctx, EVP_aes_256_ctr(), NULL, c->orig_key, NULL);
-	else if (c->keylen == 128)
-		EVP_EncryptInit_ex(aesni_ctx, EVP_aes_128_ctr(), NULL, c->orig_key, NULL);
-	else if (c->keylen == 192)
-		EVP_EncryptInit_ex(aesni_ctx, EVP_aes_192_ctr(), NULL, c->orig_key, NULL);
-	else {
-		logit("Invalid key length of %d in AES CTR MT. Exiting", c->keylen);
-		exit(1);
-	}
 
 	/*
 	 * Handle the special case of startup, one thread must fill
 	 * the first KQ then mark it as draining. Lock held throughout.
+	 * Thread 0 always does this, so it does not depend on thread ids.
 	 */
-
-	if (pthread_equal(pthread_self(), first_tid)) {
-		/* get the first element of the keyque struct */
+	if (job->idx == 0) {
 		q = &c->q[0];
 		pthread_mutex_lock(&q->lock);
 		/* if we are in the INIT state then fill the queue */
 		if (q->qstate == KQINIT) {
 			/* set the initial counter */
-			EVP_EncryptInit_ex(aesni_ctx, NULL, NULL, NULL, q->ctr);
-
-			/* encypher a block sized null string (mynull) with the key. This
+			EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr);
+			/* encrypt a block sized null string (mynull) with the key. This
 			 * returns the keystream because xoring the keystream
-			 * against null returns the keystream. Store that in the appropriate queue */
-			EVP_EncryptUpdate(aesni_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
-
-			/* add the number of blocks creates to the aes counter */
-			ssh_ctr_add(q->ctr, KQLEN * numkq, AES_BLOCK_SIZE);
+			 * against null returns the keystream. */
+			if (EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull,
+			    KQLEN * AES_BLOCK_SIZE) != 1)
+				fatal("AES-CTR MT keystream generation failed");
+			/* Update the aes counter */
+			ssh_ctr_add(q->ctr, KQLEN * c->numkq, AES_BLOCK_SIZE);
+			/* since this is the first thread set it to draining */
 			q->qstate = KQDRAINING;
 			pthread_cond_broadcast(&q->cond);
 		}
@@ -357,12 +316,9 @@ thread_loop(void *x)
 	 * Normal case is to find empty queues and fill them, skipping over
 	 * queues already filled by other threads and stopping to wait for
 	 * a draining queue to become empty.
-	 *
-	 * Multiple threads may be waiting on a draining queue and awoken
-	 * when empty.  The first thread to wake will mark it as filling,
-	 * others will move on to fill, skip, or wait on the next queue.
 	 */
-	for (qidx = 1;; qidx = (qidx + 1) % numkq) {
+	int qidx;
+	for (qidx = 1;; qidx = (qidx + 1) % c->numkq) {
 		/* Check if I was cancelled, also checked in cond_wait */
 		pthread_testcancel();
 
@@ -395,14 +351,16 @@ thread_loop(void *x)
 		pthread_mutex_unlock(&q->lock);
 
 		/* set the initial counter */
-		EVP_EncryptInit_ex(aesni_ctx, NULL, NULL, NULL, q->ctr);
+		EVP_EncryptInit_ex(evp_ctx, NULL, NULL, NULL, q->ctr);
 
 		/* see coresponding block above for useful comments */
-		EVP_EncryptUpdate(aesni_ctx, q->keys[0], &outlen, mynull, KQLEN * AES_BLOCK_SIZE);
+		if (EVP_EncryptUpdate(evp_ctx, q->keys[0], &outlen, mynull,
+		    KQLEN * AES_BLOCK_SIZE) != 1)
+			fatal("AES-CTR MT keystream generation failed");
 
 		/* Re-lock, mark full and signal consumer */
 		pthread_mutex_lock(&q->lock);
-		ssh_ctr_add(q->ctr, KQLEN * numkq, AES_BLOCK_SIZE);
+		ssh_ctr_add(q->ctr, KQLEN * c->numkq, AES_BLOCK_SIZE);
 		q->qstate = KQFULL;
 		pthread_cond_broadcast(&q->cond);
 		pthread_mutex_unlock(&q->lock);
@@ -501,7 +459,7 @@ ssh_aes_ctr(EVP_CIPHER_CTX *ctx, u_char *dest, const u_char *src,
 			oldq = q;
 
 			/* Mark next queue draining, may need to wait */
-			c->qidx = (c->qidx + 1) % numkq;
+			c->qidx = (c->qidx + 1) % c->numkq;
 			q = &c->q[c->qidx];
 			pthread_mutex_lock(&q->lock);
 			while (q->qstate != KQFULL) {
@@ -522,36 +480,42 @@ ssh_aes_ctr(EVP_CIPHER_CTX *ctx, u_char *dest, const u_char *src,
 	return 1;
 }
 
+static void
+ssh_aes_ctr_get_threads(int *threads, int *numkq)
+{
+	const char *aes_threads = getenv("SSH_CIPHER_THREADS");
+	int t;
+
+	if (aes_threads != NULL && strlen(aes_threads) != 0) {
+		t = atoi(aes_threads);
+	} else
+		t = 1;
+
+	if (t < 1)
+		t = 1;
+	if (t > MAX_THREADS)
+		t = MAX_THREADS;
+
+	*threads = t;
+	*numkq = t + 1;
+	if (*numkq > MAX_NUMKQ)
+		*numkq = MAX_NUMKQ;
+}
+
 static int
 ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
     int enc)
 {
 	struct ssh_aes_ctr_ctx_mt *c;
+	const EVP_CIPHER *cipher = NULL;
+	pthread_attr_t attr;
 	int i;
 
-	char *aes_threads = getenv("SSH_CIPHER_THREADS");
-        if (aes_threads != NULL && strlen(aes_threads) != 0)
-		cipher_threads = atoi(aes_threads);
-	else
-		cipher_threads = 1;
-
-	if (cipher_threads < 1)
- 		cipher_threads = 1;
-
-	if (cipher_threads > MAX_THREADS)
-		cipher_threads = MAX_THREADS;
-
-	numkq = cipher_threads + 1;
-
-	if (numkq > MAX_NUMKQ)
-		numkq = MAX_NUMKQ;
-
-	debug("Starting %d threads and %d queues\n", cipher_threads, numkq);
-
 	/* set up the initial state of c (our cipher stream struct) */
- 	if ((c = EVP_CIPHER_CTX_get_app_data(ctx)) == NULL) {
-		c = xmalloc(sizeof(*c));
-		pthread_rwlock_init(&c->tid_lock, NULL);
+	if ((c = EVP_CIPHER_CTX_get_app_data(ctx)) == NULL) {
+		c = xcalloc(1, sizeof(*c));
+		ssh_aes_ctr_get_threads(&c->threads, &c->numkq);
+
 #ifdef __APPLE__
 		pthread_rwlock_init(&c->stop_lock, NULL);
 		c->exit_flag = FALSE;
@@ -560,7 +524,7 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 		c->state = HAVE_NONE;
 
 		/* initialize the mutexs and conditions for each lock in our struct */
-		for (i = 0; i < numkq; i++) {
+		for (i = 0; i < c->numkq; i++) {
 			pthread_mutex_init(&c->q[i].lock, NULL);
 			pthread_cond_init(&c->q[i].cond, NULL);
 		}
@@ -585,12 +549,16 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 		c->state = HAVE_NONE;
 	}
 
-	/* set the initial key for this key stream queue */
+	/* set the initial key for this key stream queue. The key is copied:
+	 * the caller's buffer is not guaranteed to outlive this call. */
 	if (key != NULL) {
-		AES_set_encrypt_key(key, EVP_CIPHER_CTX_key_length(ctx) * 8,
-		   &c->aes_key);
-		c->orig_key = key;
-		c->keylen = EVP_CIPHER_CTX_key_length(ctx) * 8;
+		int klen = EVP_CIPHER_CTX_key_length(ctx);
+
+		if (klen > (int)sizeof(c->key))
+			fatal("AES-CTR MT key of %d bytes is too long", klen);
+		memcpy(c->key, key, klen);
+		AES_set_encrypt_key(key, klen * 8, &c->aes_key);
+		c->keylen = klen * 8;
 		c->state |= HAVE_KEY;
 	}
 
@@ -602,6 +570,20 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 	}
 
 	if (c->state == (HAVE_KEY | HAVE_IV)) {
+		switch (c->keylen) {
+		case 256:
+			cipher = EVP_aes_256_ctr();
+			break;
+		case 192:
+			cipher = EVP_aes_192_ctr();
+			break;
+		case 128:
+			cipher = EVP_aes_128_ctr();
+			break;
+		default:
+			fatal("Invalid key length of %d in AES CTR MT", c->keylen);
+		}
+
 		/* Clear queues */
 		/* set the first key in the key queue to the current counter */
 		memcpy(c->q[0].ctr, c->aes_counter, AES_BLOCK_SIZE);
@@ -609,7 +591,7 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 		c->q[0].qstate = KQINIT;
 		/* for each of the remaining queues set the first counter to the
 		 * counter and then add the size of the queue to the counter */
-		for (i = 1; i < numkq; i++) {
+		for (i = 1; i < c->numkq; i++) {
 			memcpy(c->q[i].ctr, c->aes_counter, AES_BLOCK_SIZE);
 			ssh_ctr_add(c->q[i].ctr, i * KQLEN, AES_BLOCK_SIZE);
 			c->q[i].qstate = KQEMPTY;
@@ -618,24 +600,28 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 		c->ridx = 0;
 		c->struct_id = global_struct_id++;
 
-
-		/* Start threads */
+		/* Start threads with enough stack (see functions version) */
 #define STACK_SIZE (1024 * 1024)
-		pthread_attr_t attr;
 		pthread_attr_init(&attr);
 		pthread_attr_setstacksize(&attr, STACK_SIZE);
-		for (i = 0; i < cipher_threads; i++) {
-			pthread_rwlock_wrlock(&c->tid_lock);
-			if (pthread_create(&c->tid[i], &attr, thread_loop, c) != 0)
-				fatal ("AES-CTR MT Could not create thread in %s", __FUNCTION__);
-                                /*should die here */
-			else {
-				c->id[i] = i;
-				debug ("AES-CTR MT spawned a thread with id %lu in %s (%lu, %d)",
-				       c->tid[i], __FUNCTION__, c->struct_id, c->id[i]);
-			}
-			pthread_rwlock_unlock(&c->tid_lock);
+
+		/* Each thread gets its keystream context here, keyed before the
+		 * thread exists, so a thread never has to create or key one. */
+		for (i = 0; i < c->threads; i++) {
+			c->evp[i] = EVP_CIPHER_CTX_new();
+			if (c->evp[i] == NULL ||
+			    EVP_EncryptInit_ex(c->evp[i], cipher, NULL, c->key, NULL) != 1)
+				fatal("AES-CTR MT could not set up keystream context");
+
+			c->job[i].ctx = c;
+			c->job[i].idx = i;
+			c->id[i] = i;
+			if (pthread_create(&c->tid[i], &attr, thread_loop, &c->job[i]) != 0)
+				fatal("AES-CTR MT Could not create thread in %s", __func__);
+			c->running++;
 		}
+		pthread_attr_destroy(&attr);
+
 		pthread_mutex_lock(&c->q[0].lock);
 		// wait for all of the threads to be initialized
 		while (c->q[0].qstate == KQINIT)
@@ -649,11 +635,21 @@ static int
 ssh_aes_ctr_cleanup(EVP_CIPHER_CTX *ctx)
 {
 	struct ssh_aes_ctr_ctx_mt *c;
+	int i;
 
 	if ((c = EVP_CIPHER_CTX_get_app_data(ctx)) != NULL) {
 		stop_and_join_pregen_threads(c);
 
-		memset(c, 0, sizeof(*c));
+		/* All threads are joined, so nothing can use the locks now */
+		for (i = 0; i < c->numkq; i++) {
+			pthread_mutex_destroy(&c->q[i].lock);
+			pthread_cond_destroy(&c->q[i].cond);
+		}
+#ifdef __APPLE__
+		pthread_rwlock_destroy(&c->stop_lock);
+#endif /* __APPLE__ */
+
+		explicit_bzero(c, sizeof(*c));
 		free(c);
 		EVP_CIPHER_CTX_set_app_data(ctx, NULL);
 	}

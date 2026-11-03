@@ -478,6 +478,11 @@ manager_thread(struct manager_thread_args * margs) {
 	struct worker_thread_args * wargs = malloc(NUMTHREADS * sizeof(*wargs));
 	int ti;
 
+	if (wargs == NULL) {
+		margs->retval = 1;
+		return margs;
+	}
+
 	for (ti = 0; ti < NUMTHREADS; ti++) {
 		wargs[ti].batchID = batchID;
 		wargs[ti].batch = batch;

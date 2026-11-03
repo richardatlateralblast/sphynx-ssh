@@ -30,7 +30,6 @@
 #include <sys/types.h>
 #include <pthread.h>
 #include "cipher-aesctr.h"
-#include "uthash.h"
 
 #ifndef USE_BUILTIN_RIJNDAEL
 #include <openssl/aes.h>
@@ -38,6 +37,7 @@
 
 /* only for systems with OSSL 3 */
 #ifdef WITH_OPENSSL3
+#include <openssl/evp.h>
 
 /*-------------------- TUNABLES --------------------*/
 /* maximum number of threads and queues */
@@ -97,36 +97,42 @@ struct kq {
 	u_char          pad1[CACHELINE_LEN];
 };
 
-/* AES MT context struct */
+/* AES MT context struct. Everything a pregen thread needs lives here, so
+ * no state is shared between contexts through globals. */
+struct aes_mt_ctx_st;
+
+/* Arguments for one pregen thread. Embedded in the context, so it lives as
+ * long as the context does and the thread can read it safely. */
+struct pregen_job {
+	struct aes_mt_ctx_st *ctx;
+	int                   idx;
+};
+
 struct aes_mt_ctx_st {
 	struct provider_ctx_st *provctx;
 	long unsigned int       struct_id;
-	int                     keylen;
+	int                     keylen;   /* key length in bits */
+	int                     threads;  /* pregen threads to start */
+	int                     numkq;    /* keystream queues: threads + 1 */
+	int                     running;  /* threads started and not yet joined */
 	int		        state;
 	int		        qidx;
 	int		        ridx;
 	int                     id[MAX_THREADS]; /* 32 */
 	AES_KEY                 aes_key;
-	const u_char           *orig_key;
+	/* Copy of the key. The caller's buffer is not guaranteed to outlive
+	 * the init call, and the pregen threads read the key. */
+	u_char                  key[32];
 	u_char		        aes_counter[AES_BLOCK_SIZE]; /* 16B */
 	pthread_t	        tid[MAX_THREADS]; /* 32 */
-	pthread_rwlock_t        tid_lock;
+	/* Per-thread keystream contexts. Created and keyed before their thread
+	 * starts, freed by stop_and_join after the thread has been joined. */
+	EVP_CIPHER_CTX         *evp[MAX_THREADS];
+	struct pregen_job       job[MAX_THREADS];
 	struct kq	        q[MAX_NUMKQ]; /* 33 */
 	pthread_rwlock_t        stop_lock;
 	int		        exit_flag;
 	int                     ongoing; /* possibly not needed */
-};
-
-/* this holds an array of evp context pointers that are
- * created in thread_loop. Since we can't effectively free those
- * contexts in thread_loop we keep a copy of those pointers here
- * and then free them in stop_and_join_pregenthreads
- * cjr 2/2/2023
- */
-struct aes_mt_ctx_ptrs {
-	EVP_CIPHER_CTX *pointer;
-        pthread_t       tid;
-	UT_hash_handle  hh;
 };
 
 int aes_mt_do_cipher(void *, u_char *, size_t *, size_t, const u_char *, size_t);
