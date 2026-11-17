@@ -5,5 +5,5 @@
 #define SSH_PORTABLE	"p2"
 #define SSH_SNAPSHOT    "_snapshot20261116"
 #define SSH_HPN         "_hpn18.12.0"
-#define SSH_SPHYNX      "_sphynx1.2.8"
+#define SSH_SPHYNX      "_sphynx1.2.9"
 #define SSH_RELEASE	SSH_VERSION SSH_PORTABLE SSH_SNAPSHOT SSH_HPN SSH_SPHYNX
