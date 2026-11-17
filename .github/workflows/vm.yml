@@ -12,9 +12,6 @@ on:
   pull_request:
     paths: [ '**.c', '**.h', '**.m4', '**.sh', '**/Makefile.in', 'configure.ac', 'regress/Makefile', '.github/configs', '.github/workflows/vm.yml' ]
 
-permissions:
-  contents: read
-
 jobs:
   dragonflybsd:
     name: "dragonflybsd-${{ matrix.target }}"
