@@ -1,4 +1,4 @@
-/* $OpenBSD: packet.c,v 1.346 2026/09/22 22:51:43 job Exp $ */
+/* $OpenBSD: packet.c,v 1.350 2026/10/31 03:29:22 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -89,6 +89,8 @@
 #include "ssherr.h"
 #include "sshbuf.h"
 #include "version.h"
+#include "utf8.h"
+#include "compress-huff0.h"
 
 #ifdef PACKET_DEBUG
 #define DBG(x) x
@@ -237,6 +239,9 @@ struct session_state {
 
 	/* Nagle disabled on socket */
 	int nodelay_set;
+
+	/* Set to permanently poison this connection instance */
+	int poisoned;
 
 	/* Hook for fuzzing inbound packets */
 	ssh_packet_hook_fn *hook_in;
@@ -988,6 +993,45 @@ uncompress_buffer(struct ssh *ssh, struct sshbuf *in, struct sshbuf *out)
 }
 #endif	/* WITH_ZLIB */
 
+/*
+ * huff0@hpnssh.org keeps no state between packets, so it has nothing to
+ * start; every other method is zlib.
+ */
+static int
+comp_is_huff0(const struct sshcomp *comp)
+{
+	return comp != NULL && comp->name != NULL &&
+	    strcmp(comp->name, COMP_HUFF0_NAME) == 0;
+}
+
+static int
+start_compression(struct ssh *ssh, const struct sshcomp *comp, int mode)
+{
+	if (comp_is_huff0(comp))
+		return 0;
+	if (mode == MODE_OUT)
+		return start_compression_out(ssh);
+	return start_compression_in(ssh);
+}
+
+static int
+compress_packet(struct ssh *ssh, const struct sshcomp *comp,
+    struct sshbuf *in, struct sshbuf *out)
+{
+	if (comp_is_huff0(comp))
+		return huff0_compress(in, out);
+	return compress_buffer(ssh, in, out);
+}
+
+static int
+uncompress_packet(struct ssh *ssh, const struct sshcomp *comp,
+    struct sshbuf *in, struct sshbuf *out)
+{
+	if (comp_is_huff0(comp))
+		return huff0_uncompress(in, out, packet_max_size);
+	return uncompress_buffer(ssh, in, out);
+}
+
 void
 ssh_clear_newkeys(struct ssh *ssh, int mode)
 {
@@ -1054,7 +1098,7 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 	/* if we are using NONE MAC then we don't need to enable the
 	 * mac routines. This disables them and we can claw back some cycles
 	 * from the CPU -cjr 3/21/2023 */
-	if (ssh->none_mac != 1)
+	if (mac->name == NULL || strcmp(mac->name, "none") != 0)
 		mac->enabled = 1;
 
 	DBG(debug_f("cipher_init: %s", dir));
@@ -1069,7 +1113,7 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 			enc->cipher = cipher_by_name(
 			    "chacha20-poly1305@openssh.com");
 		if (enc->cipher == NULL)
-			return r;
+			return SSH_ERR_INTERNAL_ERROR;
 	}
 #endif
 	if ((r = cipher_init(ccp, enc->cipher, enc->key, enc->key_len, enc->iv,
@@ -1089,13 +1133,8 @@ ssh_set_newkeys(struct ssh *ssh, int mode)
 	    comp->enabled == 0) {
 		if ((r = ssh_packet_init_compression(ssh)) < 0)
 			return r;
-		if (mode == MODE_OUT) {
-			if ((r = start_compression_out(ssh)) != 0)
-				return r;
-		} else {
-			if ((r = start_compression_in(ssh)) != 0)
-				return r;
-		}
+		if ((r = start_compression(ssh, comp, mode)) != 0)
+			return r;
 		comp->enabled = 1;
 	}
 	/* get the maximum number of blocks the cipher can
@@ -1263,13 +1302,8 @@ ssh_packet_enable_delayed_compress(struct ssh *ssh)
 		if (comp && !comp->enabled && comp->type == COMP_DELAYED) {
 			if ((r = ssh_packet_init_compression(ssh)) != 0)
 				return r;
-			if (mode == MODE_OUT) {
-				if ((r = start_compression_out(ssh)) != 0)
-					return r;
-			} else {
-				if ((r = start_compression_in(ssh)) != 0)
-					return r;
-			}
+			if ((r = start_compression(ssh, comp, mode)) != 0)
+				return r;
 			comp->enabled = 1;
 		}
 	}
@@ -1333,7 +1367,7 @@ ssh_packet_send2_wrapped(struct ssh *ssh)
 		if ((r = sshbuf_consume(state->outgoing_packet, 5)) != 0)
 			goto out;
 		sshbuf_reset(state->compression_buffer);
-		if ((r = compress_buffer(ssh, state->outgoing_packet,
+		if ((r = compress_packet(ssh, comp, state->outgoing_packet,
 		    state->compression_buffer)) != 0)
 			goto out;
 		sshbuf_reset(state->outgoing_packet);
@@ -1575,6 +1609,9 @@ ssh_packet_read_seqnr(struct ssh *ssh, u_char *typep, uint32_t *seqnr_p)
 
 	DBG(debug("packet_read()"));
 
+	if (state->poisoned)
+		return SSH_ERR_PROTOCOL_ERROR;
+
 	/*
 	 * Since we are blocking, ensure that all written packets have
 	 * been sent.
@@ -1666,6 +1703,8 @@ ssh_packet_read_poll2_mux(struct ssh *ssh, u_char *typep, uint32_t *seqnr_p)
 
 	if (ssh->kex)
 		return SSH_ERR_INTERNAL_ERROR;
+	if (state->poisoned)
+		return SSH_ERR_PROTOCOL_ERROR;
 	*typep = SSH_MSG_NONE;
 	cp = sshbuf_ptr(state->input);
 	if (state->packlen == 0) {
@@ -1708,6 +1747,8 @@ ssh_packet_read_poll2(struct ssh *ssh, u_char *typep, uint32_t *seqnr_p)
 
 	if (state->mux)
 		return ssh_packet_read_poll2_mux(ssh, typep, seqnr_p);
+	if (state->poisoned)
+		return SSH_ERR_PROTOCOL_ERROR;
 
 	*typep = SSH_MSG_NONE;
 
@@ -1881,7 +1922,7 @@ ssh_packet_read_poll2(struct ssh *ssh, u_char *typep, uint32_t *seqnr_p)
 	    sshbuf_len(state->incoming_packet)));
 	if (comp && comp->enabled) {
 		sshbuf_reset(state->compression_buffer);
-		if ((r = uncompress_buffer(ssh, state->incoming_packet,
+		if ((r = uncompress_packet(ssh, comp, state->incoming_packet,
 		    state->compression_buffer)) != 0)
 			goto out;
 		sshbuf_reset(state->incoming_packet);
@@ -2009,6 +2050,11 @@ ssh_packet_read_poll_seqnr(struct ssh *ssh, u_char *typep, uint32_t *seqnr_p)
 			}
 			if (ssh_packet_is_rekeying(ssh)) {
 				DBG(debug("Won't reply to PING during KEX"));
+				break;
+			}
+			/* Don't let replies pile up if the peer isn't reading */
+			if (!ssh_packet_not_very_much_data_to_write(ssh)) {
+				DBG(debug("Won't reply to PING with backlog"));
 				break;
 			}
 			if ((r = sshpkt_start(ssh, SSH2_MSG_PONG)) != 0 ||
@@ -2214,11 +2260,12 @@ sshpkt_final_log_entry (struct ssh *ssh) {
 	else
 		total_time = monotime_double() - ssh->start_time;
 
+	/* a session that ended at once has no rate to report */
 	logit("SSH: Server;LType: Throughput;Remote: %s-%d;IN: %lu;OUT: %lu;Duration: %.1f;tPut_in: %.1f;tPut_out: %.1f",
 	      ssh_remote_ipaddr(ssh), ssh_remote_port(ssh),
 	      ssh->stdin_bytes, ssh->fdout_bytes, total_time,
-	      ssh->stdin_bytes / total_time,
-	      ssh->fdout_bytes / total_time);
+	      total_time > 0 ? ssh->stdin_bytes / total_time : 0.0,
+	      total_time > 0 ? ssh->fdout_bytes / total_time : 0.0);
 }
 
 /*
@@ -3042,6 +3089,8 @@ sshpkt_msg_ignore(struct ssh *ssh, u_int nbytes)
 int
 sshpkt_send(struct ssh *ssh)
 {
+	if (ssh->state && ssh->state->poisoned)
+		return SSH_ERR_PROTOCOL_ERROR;
 	if (ssh->state && ssh->state->mux)
 		return ssh_packet_send_mux(ssh);
 	return ssh_packet_send2(ssh);
@@ -3066,6 +3115,35 @@ sshpkt_disconnect(struct ssh *ssh, const char *fmt,...)
 	    (r = sshpkt_send(ssh)) != 0)
 		return r;
 	return 0;
+}
+
+/*
+ * Logs a protocol violation by the peer, sends a disconnect packet and
+ * returns SSH_ERR_PROTOCOL_ERROR for the caller to propagate.
+ * This does not terminate the connection, but does "poison" the packet
+ * code so further attempts to read/write will fail with the same error.
+ */
+int
+sshpkt_protocol_error(struct ssh *ssh, const char *fmt,...)
+{
+	char buf[1024], remote_id[512];
+	va_list args;
+	int r;
+
+	sshpkt_fmt_connection_id(ssh, remote_id, sizeof(remote_id));
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	logit("Disconnecting %s: %.100s", remote_id, buf);
+	if (ssh->state == NULL)
+		cleanup_exit(255); /* Can't poison? then exit */
+
+	if ((r = sshpkt_disconnect(ssh, "%s", buf)) != 0 ||
+	    (r = ssh_packet_write_wait(ssh)) != 0)
+		return r;
+	ssh->state->poisoned = 1;
+	return SSH_ERR_PROTOCOL_ERROR;
 }
 
 /* roundup current message to pad bytes */
@@ -3168,8 +3246,9 @@ connection_info_message(struct ssh *ssh)
 	struct kex *kex;
 	struct session_state *state;
 	struct newkeys *nk_in, *nk_out;
-	char *stats_in = NULL, *stats_out = NULL;
+	char *stats_in = NULL, *stats_out = NULL, *remote_version = NULL;
 	uint64_t epoch = (uint64_t)time(NULL) - monotime();
+	int w;
 
 	if (ssh == NULL)
 		return NULL;
@@ -3224,6 +3303,15 @@ connection_info_message(struct ssh *ssh)
 	}
 	comp_info = comp_status_message(ssh);
 
+	/*
+	 * The remote version string was supplied by the peer; don't let
+	 * control characters in it mess up the display.
+	 */
+	w = INT_MAX;
+	asmprintf(&remote_version, INT_MAX, &w, "%s", ssh->remote_version);
+	if (remote_version == NULL)
+		fatal_f("asmprintf failed");
+
 	xasprintf(&ret, "Connection information for %s pid %lld\r\n"
 	    "  versions %s -> %s\r\n"
 	    "%s"
@@ -3234,7 +3322,7 @@ connection_info_message(struct ssh *ssh)
 	    "  traffic %s in, %s out\r\n"
 	    "%s",
 	    thishost, (long long)getpid(),
-	    SSH_RELEASE, ssh->remote_version,
+	    SSH_RELEASE, remote_version,
 	    tcp_info,
 	    fmt_timeframe(monotime() - state->start_time),
 	    kex->name, kex->hostkey_alg,
@@ -3252,5 +3340,6 @@ connection_info_message(struct ssh *ssh)
 	free(rekey_volume);
 	free(rekey_time);
 	free(comp_info);
+	free(remote_version);
 	return ret;
 }

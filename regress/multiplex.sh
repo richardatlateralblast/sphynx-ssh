@@ -222,7 +222,7 @@ else
 fi
 if [ "$compression" = "yes" ]; then
 	verbose "test $tid: cmd conninfo compression"
-	if echo "$conninfo" | grep "compression zlib" >/dev/null &&
+	if echo "$conninfo" | grep -E "compression (zlib|huff0@hpnssh.org)" >/dev/null &&
 	    echo "$conninfo" | grep "compressed" >/dev/null; then
 		trace "ok conninfo compression"
 	else

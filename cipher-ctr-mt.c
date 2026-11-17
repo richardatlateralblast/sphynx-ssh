@@ -159,6 +159,7 @@ struct ssh_aes_ctr_ctx_mt
 	 * starts; freed by stop_and_join after the thread has been joined. */
 	EVP_CIPHER_CTX *evp[MAX_THREADS];
 	struct pregen_job job[MAX_THREADS];
+	pid_t pid; /* process that started the threads */
 	struct kq q[MAX_NUMKQ]; /* 33 */
 #ifdef __APPLE__
 	pthread_rwlock_t stop_lock;
@@ -229,6 +230,13 @@ static void
 stop_and_join_pregen_threads(struct ssh_aes_ctr_ctx_mt *c)
 {
 	int i;
+
+	/* A forked child has this context but not its threads, and joining them
+	 * waits for ever; see the same test in cipher-ctr-mt-functions.c */
+	if (c->pid != 0 && c->pid != getpid()) {
+		c->running = 0;
+		return;
+	}
 
 #ifdef __APPLE__
 	/* notify threads that they should exit */
@@ -619,6 +627,7 @@ ssh_aes_ctr_init(EVP_CIPHER_CTX *ctx, const u_char *key, const u_char *iv,
 			if (pthread_create(&c->tid[i], &attr, thread_loop, &c->job[i]) != 0)
 				fatal("AES-CTR MT Could not create thread in %s", __func__);
 			c->running++;
+			c->pid = getpid();
 		}
 		pthread_attr_destroy(&attr);
 
@@ -635,19 +644,23 @@ static int
 ssh_aes_ctr_cleanup(EVP_CIPHER_CTX *ctx)
 {
 	struct ssh_aes_ctr_ctx_mt *c;
-	int i;
+	int i, forked;
 
 	if ((c = EVP_CIPHER_CTX_get_app_data(ctx)) != NULL) {
+		forked = c->pid != 0 && c->pid != getpid();
 		stop_and_join_pregen_threads(c);
 
-		/* All threads are joined, so nothing can use the locks now */
-		for (i = 0; i < c->numkq; i++) {
-			pthread_mutex_destroy(&c->q[i].lock);
-			pthread_cond_destroy(&c->q[i].cond);
-		}
+		/* All threads are joined, so nothing can use the locks now. In a
+		 * forked child they may be held by a thread that is not here. */
+		if (!forked) {
+			for (i = 0; i < c->numkq; i++) {
+				pthread_mutex_destroy(&c->q[i].lock);
+				pthread_cond_destroy(&c->q[i].cond);
+			}
 #ifdef __APPLE__
-		pthread_rwlock_destroy(&c->stop_lock);
+			pthread_rwlock_destroy(&c->stop_lock);
 #endif /* __APPLE__ */
+		}
 
 		explicit_bzero(c, sizeof(*c));
 		free(c);

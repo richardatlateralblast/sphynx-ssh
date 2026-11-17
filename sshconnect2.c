@@ -1,4 +1,4 @@
-/* $OpenBSD: sshconnect2.c,v 1.394 2026/09/16 00:31:27 djm Exp $ */
+/* $OpenBSD: sshconnect2.c,v 1.395 2026/10/11 20:41:20 dtucker Exp $ */
 /*
  * Copyright (c) 2000 Markus Friedl.  All rights reserved.
  * Copyright (c) 2008 Damien Miller.  All rights reserved.
@@ -494,26 +494,23 @@ ssh_userauth2(struct ssh *ssh, const char *local_user,
 	 */
 	if (options.none_switch == 1 && options.none_enabled == 1) {
 		char *myproposal[PROPOSAL_MAX];
-		char *s = NULL;
 		const char *none_cipher = "none";
 		if (!tty_flag) { /* no null on tty sessions */
-			debug("Requesting none rekeying...");
-			kex_proposal_populate_entries(ssh, myproposal, s, none_cipher,
-						      options.macs,
-						      compression_alg_list(options.compression),
-						      options.hostkeyalgorithms);
-			fprintf(stderr, "WARNING: ENABLED NONE CIPHER!!!\n");
-
 			/* NONEMAC can only be used in context of the NONE CIPHER */
-			if (options.nonemac_enabled == 1) {
-				const char *none_mac = "none";
-				kex_proposal_populate_entries(ssh, myproposal, s, none_cipher,
-							      none_mac,
-							      compression_alg_list(options.compression),
-							      options.hostkeyalgorithms);
+			const char *macs = options.nonemac_enabled == 1 ?
+			    "none" : options.macs;
+
+			debug("Requesting none rekeying...");
+			/* keep the user's KexAlgorithms; only the cipher and MAC change */
+			kex_proposal_populate_entries(ssh, myproposal,
+			    options.kex_algorithms, none_cipher, macs,
+			    compression_alg_list(options.compression),
+			    options.hostkeyalgorithms);
+			fprintf(stderr, "WARNING: ENABLED NONE CIPHER!!!\n");
+			if (options.nonemac_enabled == 1)
 				fprintf(stderr, "WARNING: ENABLED NONE MAC\n");
-			}
 			kex_prop2buf(ssh->kex->my, myproposal);
+			kex_proposal_free_entries(myproposal);
 			packet_request_rekeying();
 		} else {
 			/* requested NONE cipher when in a tty */
@@ -1454,14 +1451,9 @@ sign_and_send_pubkey(struct ssh *ssh, Identity *id)
 		sshbuf_free(b);
 		if ((b = sshbuf_new()) == NULL)
 			fatal_f("sshbuf_new failed");
-		if (ssh->compat & SSH_OLD_SESSIONID) {
-			if ((r = sshbuf_putb(b, ssh->kex->session_id)) != 0)
-				fatal_fr(r, "sshbuf_putb");
-		} else {
-			if ((r = sshbuf_put_stringb(b,
-			    ssh->kex->session_id)) != 0)
-				fatal_fr(r, "sshbuf_put_stringb");
-		}
+		if ((r = sshbuf_put_stringb(b,
+		    ssh->kex->session_id)) != 0)
+			fatal_fr(r, "sshbuf_put_stringb");
 		skip = sshbuf_len(b);
 		if ((r = sshbuf_put_u8(b, SSH2_MSG_USERAUTH_REQUEST)) != 0 ||
 		    (r = sshbuf_put_cstring(b, authctxt->server_user)) != 0 ||

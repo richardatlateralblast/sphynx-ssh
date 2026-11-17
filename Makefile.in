@@ -1,4 +1,4 @@
-SHELL=@SH@
+SHELL=@POSIX_SHELL@
 
 AUTORECONF=autoreconf
 
@@ -30,7 +30,7 @@ SSH_SK_HELPER=$(libexecdir)/hpnssh-sk-helper
 PRIVSEP_PATH=@PRIVSEP_PATH@
 SSH_PRIVSEP_USER=@SSH_PRIVSEP_USER@
 STRIP_OPT=@STRIP_OPT@
-TEST_SHELL=@TEST_SHELL@
+TEST_SHELL=@POSIX_SHELL@
 BUILDDIR=@abs_top_builddir@
 SK_STANDALONE=@SK_STANDALONE@
 COMPATINCLUDES="$(BUILDDIR)/@COMPATINCLUDES@"
@@ -92,7 +92,10 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
 	authfd.o authfile.o \
 	canohost.o channels.o cipher.o cipher-aes.o cipher-aesctr.o \
 	cleanup.o cipher-ctr-mt.o \
-	compat.o fatal.o hostfile.o \
+	compat.o compress-huff0.o fatal.o hostfile.o \
+	huff0/entropy_common.o huff0/error_private.o huff0/fse_compress.o \
+	huff0/fse_decompress.o huff0/hist.o huff0/huf_compress.o \
+	huff0/huf_decompress.o \
 	log.o match.o moduli.o nchan.o packet.o \
 	readpass.o ttymodes.o xmalloc.o addr.o addrmatch.o \
 	atomicio.o dispatch.o mac.o misc.o utf8.o \
@@ -302,6 +305,7 @@ moduli:
 
 clean:	regressclean
 	rm -f *.o *.lo *.a $(TARGETS) logintest config.cache config.log
+	rm -f huff0/*.o
 	rm -f *.out core survey
 	rm -f regress/check-perm$(EXEEXT)
 	rm -f regress/mkdtemp$(EXEEXT)
@@ -386,6 +390,7 @@ clean:	regressclean
 
 distclean:	regressclean
 	rm -f *.o *.a $(TARGETS) logintest config.cache config.log
+	rm -f huff0/*.o
 	rm -f *.out core opensshd.init openssh.xml
 	rm -f hpnsshd.init hpnsshd.service
 	rm -f Makefile buildpkg.sh config.h config.status
@@ -817,7 +822,7 @@ SK_DUMMY_LIBRARY=@SK_DUMMY_LIBRARY@
 .c.lo: Makefile.in config.h
 	$(CC) $(CFLAGS_NOPIE) $(PICFLAG) $(CPPFLAGS) -c $< -o $@
 
-regress/misc/sk-dummy/sk-dummy.so: $(SK_DUMMY_OBJS)
+regress/misc/sk-dummy/sk-dummy.so: regress-prep $(SK_DUMMY_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(PICFLAG) -shared -o $@ $(SK_DUMMY_OBJS) \
 	    -L. -Lopenbsd-compat -lopenbsd-compat $(LDFLAGS_NOPIE) $(TESTLIBS)
 

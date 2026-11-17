@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh.c,v 1.642 2026/09/23 21:42:39 djm Exp $ */
+/* $OpenBSD: ssh.c,v 1.647 2026/11/02 06:49:42 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -268,7 +268,12 @@ resolve_host(const char *name, int port, int logerr, char *cname, size_t clen)
 		return NULL;
 	}
 	if (cname != NULL && res->ai_canonname != NULL) {
-		if (!valid_domain(res->ai_canonname, 0, &errstr)) {
+		/*
+		 * Force the name returned by the resolver to lowercase before
+		 * it is matched against CanonicalizePermittedCNAMEs, so that
+		 * case in the answer (e.g. DNS0x20) cannot slip past a pattern.
+		 */
+		if (!valid_domain(res->ai_canonname, 1, &errstr)) {
 			error("ignoring bad CNAME \"%s\" for host \"%s\": %s",
 			    res->ai_canonname, name, errstr);
 		} else if (strlcpy(cname, res->ai_canonname, clen) >= clen) {
@@ -393,14 +398,18 @@ check_follow_cname(int direct, char **namep, const char *cname)
 	debug3_f("check \"%s\" CNAME \"%s\"", *namep, cname);
 	for (i = 0; i < options.num_permitted_cnames; i++) {
 		rule = options.permitted_cnames + i;
+		/*
+		 * The CNAME comes from the resolver and may be in any case
+		 * (e.g. DNS0x20); match it lowercased so that a negated
+		 * target pattern cannot be evaded by capitalisation.
+		 */
 		if (match_pattern_list(*namep, rule->source_list, 1) != 1 ||
-		    match_pattern_list(cname, rule->target_list, 1) != 1)
+		    match_hostname(cname, rule->target_list) != 1)
 			continue;
 		verbose("Canonicalized DNS aliased hostname "
 		    "\"%s\" => \"%s\"", *namep, cname);
 		free(*namep);
 		*namep = xstrdup(cname);
-		lowercase(*namep);
 		return 1;
 	}
 	return 0;
@@ -632,6 +641,7 @@ main(int ac, char **av)
 	extern char *optarg;
 	struct Forward fwd;
 	struct addrinfo *addrs = NULL;
+	int fallback_tried;
 	size_t n, len;
 	u_int j;
 	struct utsname utsname;
@@ -812,6 +822,8 @@ main(int ac, char **av)
 				cp = sshkey_alg_list(0, 1, 1, '\n');
 			else if (strcmp(optarg, "protocol-version") == 0)
 				cp = xstrdup("2");
+			else if (strcasecmp(optarg, "addressfamily") == 0)
+				cp = supported_address_family();
 			else if (strcmp(optarg, "compression") == 0) {
 				cp = xstrdup(compression_alg_list(0));
 				len = strlen(cp);
@@ -820,13 +832,16 @@ main(int ac, char **av)
 						cp[n] = '\n';
 			} else if (strcmp(optarg, "help") == 0) {
 				cp = xstrdup(
+				    "addressfamily\n"
 				    "cipher\ncipher-auth\ncompression\nkex\n"
 				    "key\nkey-cert\nkey-plain\nkey-sig\nmac\n"
 				    "protocol-version\nsig");
 			}
 			if (cp == NULL)
 				fatal("Unsupported query \"%s\"", optarg);
-			printf("%s\n", cp);
+			printf("%s", cp);
+			if ((len = strlen(cp)) == 0 || cp[len-1] != '\n')
+				printf("\n");
 			free(cp);
 			exit(0);
 			break;
@@ -1424,8 +1439,7 @@ main(int ac, char **av)
 	cinfo->remhost = xstrdup(host);
 	cinfo->homedir = xstrdup(pw->pw_dir);
 	cinfo->locuser = xstrdup(pw->pw_name);
-	cinfo->jmphost = xstrdup(options.jump_host == NULL ?
-	    "" : options.jump_host);
+	cinfo->jmphost = ssh_jump_spec(&options);
 
 	/*
 	 * If the user was specified via a configuration directive then attempt
@@ -1640,7 +1654,8 @@ main(int ac, char **av)
 
 	if (muxclient_command != 0 && options.control_path == NULL)
 		fatal("No ControlPath specified for \"-O\" command");
-	if (options.control_path != NULL) {
+	/* NB. -Z only lists keys; it must not start a session via a master */
+	if (options.control_path != NULL && !dump_pubkeys) {
 		int sock;
 		if ((sock = muxclient(options.control_path)) >= 0) {
 			if (ssh_packet_set_connection(ssh, sock, sock) == NULL)
@@ -1722,14 +1737,19 @@ main(int ac, char **av)
 	 * if that fails we reset the port to SSH_DEFAULT_PORT
 	 * -cjr 8/17/2022
 	 */
+	fallback_tried = 0;
 tryagain:
 	if (ssh_connect(ssh, host, options.host_arg, addrs, &hostaddr,
 	    options.port, options.connection_attempts,
 	    &timeout_ms, options.tcp_keep_alive) != 0) {
 		/* could not connect. If the port requested is the same as
 		 * hpnssh default port then fallback. Otherwise, exit */
-		if ((options.port == default_ssh_port()) && options.fallback) {
+		if ((options.port == default_ssh_port()) && options.fallback &&
+		    !fallback_tried) {
 			int port = options.fallback_port;
+			/* once only: with FallbackPort set to the default
+			 * port this would otherwise try the same port for ever */
+			fallback_tried = 1;
 			options.port = port;
 			fprintf(stderr, "HPNSSH server not available on default port %d\n",
 				default_ssh_port());
@@ -1739,8 +1759,19 @@ tryagain:
 			else
 				fprintf(stderr, "Falling back to user defined port %d\n",
 					port);
+			if (addrs != NULL)
+				freeaddrinfo(addrs);
 			addrs = resolve_host(host, port, 1,
 					     cname, sizeof(cname));
+			/*
+			 * The first attempt left the time that remained of
+			 * ConnectTimeout in timeout_ms, which is 0 once it ran
+			 * out, and 0 means no limit: give this one a full turn.
+			 */
+			if (options.connection_timeout >= INT_MAX/1000)
+				timeout_ms = INT_MAX;
+			else
+				timeout_ms = options.connection_timeout * 1000;
 			goto tryagain;
 		} else {
 			exit(255);
@@ -2590,7 +2621,10 @@ main_sigchld_handler(int sig)
 	int status;
 
 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0 ||
-	    (pid == -1 && errno == EINTR))
-		;
+	    (pid == -1 && errno == EINTR)) {
+		/* Once reaped, the ProxyCommand's pid may be reused. */
+		if (pid > 0)
+			ssh_proxy_command_reaped(pid);
+	}
 	errno = save_errno;
 }

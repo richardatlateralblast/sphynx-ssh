@@ -339,17 +339,31 @@ static const OSSL_PARAM *aes_mt_gettable_ctx_params(void *cctx, void *provctx)
 	return ctx_get_param_table;
 }
 
+/* The context libcrypto holds for this cipher is an EVP_CIPHER_CTX (see
+ * aes_mt_newctx), and the real state is its app data. Every function that
+ * takes the context has to unwrap it first: reading it as the state itself
+ * reads and writes memory that is not ours, and a field 17 MB into the state
+ * lies far outside the small EVP_CIPHER_CTX it really is. */
+static struct aes_mt_ctx_st *aes_mt_state(void *vctx)
+{
+    return EVP_CIPHER_CTX_get_app_data((EVP_CIPHER_CTX *)vctx);
+}
+
 static int aes_mt_get_ctx_params(void *vctx, OSSL_PARAM params[])
 {
-    struct aes_mt_ctx_st *ctx = vctx;
+    struct aes_mt_ctx_st *ctx = aes_mt_state(vctx);
     int ok = 1;
 
+    if (ctx == NULL)
+        return 0;
+
+    /* the state counts key bits, the parameter is in bytes */
     if (ctx->keylen > 0) {
         OSSL_PARAM *p;
 
         for (p = params; p->key != NULL; p++)
             if (strcasecmp(p->key, "keylen") == 0
-                && provnum_set_size_t(p, ctx->keylen) < 0) {
+                && provnum_set_size_t(p, ctx->keylen / 8) < 0) {
                 ok = 0;
                 continue;
             }
@@ -365,9 +379,12 @@ static const OSSL_PARAM *aes_mt_settable_ctx_params(void *cctx, void *provctx)
 
 static int aes_mt_set_ctx_params(void *vctx, const OSSL_PARAM params[])
 {
-    struct aes_mt_ctx_st *ctx = vctx;
+    struct aes_mt_ctx_st *ctx = aes_mt_state(vctx);
     const OSSL_PARAM *p;
     int ok = 1;
+
+    if (ctx == NULL)
+        return 0;
 
     if (ctx->ongoing) {
         ERR_raise(ERR_HANDLE(ctx), AES_MT_ONGOING_OPERATION);
@@ -382,7 +399,8 @@ static int aes_mt_set_ctx_params(void *vctx, const OSSL_PARAM params[])
                 ok = 0;
                 continue;
             }
-            ctx->keylen = keyl;
+            /* the parameter is in bytes, the state counts bits */
+            ctx->keylen = keyl * 8;
         }
     return ok;
 }

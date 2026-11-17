@@ -133,13 +133,13 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 	/* Create a socket for connecting */
 	sock = ssh_create_socket(ai);
 	if (sock < 0) {
-		/* Any error is already output */
-		errno = 0;
+		/* Any error is already output, and errno still says what it was */
 		return -1;
 	}
 	if (sock >= FD_SETSIZE) {
 		error("socket number to big for select: %d", sock);
 		close(sock);
+		errno = EMFILE;
 		return -1;
 	}
 	fd_ai[sock] = ai;
@@ -152,10 +152,13 @@ happy_eyeballs_initiate(const char *host, struct addrinfo *ai,
 	debug2_f("RFC 8305 pre-connect for %s", return_fam(ai->ai_family));
 	if (connect(sock, ai->ai_addr, ai->ai_addrlen) < 0 &&
 	    errno != EINPROGRESS) {
+		oerrno = errno;
 		error("connect to address %s port %s: %s",
-		      ntop, strport, strerror(errno));
-		errno = 0;
+		      ntop, strport, strerror(oerrno));
 		close(sock);
+		/* keep the reason: it is what the caller reports if every
+		 * address fails */
+		errno = oerrno;
 		return -1;
 	}
 	debug_f("RFC 8305 post connect for %s", return_fam(ai->ai_family));
@@ -176,8 +179,11 @@ happy_eyeballs_process(int *nfds, fd_set *fds,
 
 	debug2_f("Processing RFC 8305 connections");
 	for (sock = *nfds - 1; ready > 0 && sock >= 0; sock--) {
-		debug2_f("RFC 8305: Processing for %s: %d", return_fam(fd_ai[sock]->ai_family), sock);
+		/* fd_ai has an entry only for the sockets opened here, and
+		 * the descriptors below nfds are not all of them */
 		if (FD_ISSET(sock, wfds)) {
+			debug2_f("RFC 8305: Processing for %s: %d",
+			    return_fam(fd_ai[sock]->ai_family), sock);
 			debug2_f("RFC 8305: FD_ISSET true for %d", sock);
 			ready--;
 			optlen = sizeof(optval);
@@ -229,6 +235,7 @@ happy_eyeballs(const char * host, struct addrinfo *ai,
 
 	debug_f("Starting RFC 8305/Happy Eyeballs connection");
 
+	memset(fd_ai, 0, sizeof(fd_ai));
 	FD_ZERO(&fds);
 	if (*timeout_ms > 0) /* default value of no timeout - use TCP default instead */
 		monotime_tv(&start_tv); /* monotime_tv is in misc.c */

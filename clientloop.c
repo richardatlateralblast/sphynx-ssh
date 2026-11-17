@@ -1,4 +1,4 @@
-/* $OpenBSD: clientloop.c,v 1.427 2026/09/16 23:26:41 jsg Exp $ */
+/* $OpenBSD: clientloop.c,v 1.429 2026/10/30 09:00:39 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -129,6 +129,9 @@ extern char *host;
  */
 extern char *forward_agent_sock_path;
 
+/* Set if we continued past a host key verification failure (sshconnect.c) */
+extern int hostkey_untrusted;
+
 /*
  * Flag to indicate that we have received a window change signal which has
  * not yet been processed.  This will cause a message indicating the new
@@ -154,6 +157,30 @@ static time_t x11_refuse_time;	/* If >0, refuse x11 opens after this time. */
 static time_t server_alive_time;	/* Time to do server_alive_check */
 static int hostkeys_update_complete;
 static int session_setup_complete;
+
+/*
+ * While client_loop() runs it keeps the termination signals blocked, and
+ * unblocks them only inside ppoll(). A child started from the loop would
+ * inherit that mask and ignore HUP, INT, QUIT and TERM, so this points at the
+ * mask to give a child while the loop has them blocked, and is NULL otherwise.
+ */
+static const sigset_t *loop_child_sigmask;
+
+/* Give the caller the mask a child should start with; see client_sigmask_end() */
+int
+client_sigmask_begin(sigset_t *saved)
+{
+	if (loop_child_sigmask == NULL)
+		return 0;
+	return sigprocmask(SIG_SETMASK, loop_child_sigmask, saved) == 0;
+}
+
+void
+client_sigmask_end(int swapped, const sigset_t *saved)
+{
+	if (swapped && sigprocmask(SIG_SETMASK, saved, NULL) == -1)
+		error_f("sigprocmask: %s", strerror(errno));
+}
 
 static void client_init_dispatch(struct ssh *ssh);
 int	session_ident = -1;
@@ -299,7 +326,8 @@ client_x11_get_proto(struct ssh *ssh, const char *display,
 	char xauthfile[PATH_MAX], xauthdir[PATH_MAX];
 	static char proto[512], data[512];
 	FILE *f;
-	int got_data = 0, generated = 0, do_unlink = 0, r;
+	int got_data = 0, generated = 0, do_unlink = 0, r, swapped;
+	sigset_t saved_sigs;
 	struct stat st;
 	u_int now, x11_timeout_real;
 
@@ -389,8 +417,10 @@ client_x11_get_proto(struct ssh *ssh, const char *display,
 				channel_set_x11_refuse_time(ssh,
 				    x11_refuse_time);
 			}
+			swapped = client_sigmask_begin(&saved_sigs);
 			if (system(cmd) == 0)
 				generated = 1;
+			client_sigmask_end(swapped, &saved_sigs);
 			free(cmd);
 		}
 
@@ -407,7 +437,9 @@ client_x11_get_proto(struct ssh *ssh, const char *display,
 			    generated ? xauthfile : "",
 			    display);
 			debug2("x11_get_proto: %s", cmd);
+			swapped = client_sigmask_begin(&saved_sigs);
 			f = popen(cmd, "r");
+			client_sigmask_end(swapped, &saved_sigs);
 			if (f && fgets(line, sizeof(line), f) &&
 			    sscanf(line, "%*s %511s %511s", proto, data) == 2)
 				got_data = 1;
@@ -991,14 +1023,18 @@ process_cmdline(struct ssh *ssh)
 {
 	void (*handler)(int);
 	char *s, *cmd;
-	int ok, delete = 0, local = 0, remote = 0, dynamic = 0;
+	int ok, delete = 0, local = 0, remote = 0, dynamic = 0, swapped;
+	sigset_t saved_sigs;
 	struct Forward fwd;
 
 	memset(&fwd, 0, sizeof(fwd));
 
 	leave_raw_mode(options.request_tty == REQUEST_TTY_FORCE);
 	handler = ssh_signal(SIGINT, SIG_IGN);
+	/* a prompt must be interruptible, and its askpass must not start blocked */
+	swapped = client_sigmask_begin(&saved_sigs);
 	cmd = s = read_passphrase("\r\nssh> ", RP_ECHO);
+	client_sigmask_end(swapped, &saved_sigs);
 	if (s == NULL)
 		goto out;
 	while (isspace((u_char)*s))
@@ -1031,7 +1067,9 @@ process_cmdline(struct ssh *ssh)
 
 	if (*s == '!' && options.permit_local_command) {
 		s++;
+		swapped = client_sigmask_begin(&saved_sigs);
 		ssh_local_cmd(s);
+		client_sigmask_end(swapped, &saved_sigs);
 		goto out;
 	}
 
@@ -1075,6 +1113,11 @@ process_cmdline(struct ssh *ssh)
 		}
 		logit("Canceled forwarding.");
 	} else {
+		if (hostkey_untrusted) {
+			logit("Port forwarding is disabled to avoid "
+			    "monster-in-the-middle attacks.");
+			goto out;
+		}
 		/* -R specs can be both dynamic or not, so check both. */
 		if (remote) {
 			if (!parse_forward(&fwd, s, 0, remote) &&
@@ -1580,6 +1623,7 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	 */
 	if (sigprocmask(SIG_BLOCK, &bsigset, &osigset) == -1)
 		error_f("bsigset sigprocmask: %s", strerror(errno));
+	loop_child_sigmask = &osigset;
 
 	/* Main loop of the client for the interactive session mode. */
 	while (!quit_pending) {
@@ -1684,6 +1728,7 @@ client_loop(struct ssh *ssh, int have_pty, int escape_char_arg,
 	}
 
 	/* Restore the pre-loop signal mask now that we are done polling. */
+	loop_child_sigmask = NULL;
 	if (sigprocmask(SIG_SETMASK, &osigset, NULL) == -1)
 		error_f("osigset sigprocmask: %s", strerror(errno));
 
@@ -2308,6 +2353,8 @@ update_known_hosts(struct hostkeys_update_ctx *ctx)
 	char *fp, *response;
 	size_t i;
 	struct stat sb;
+	sigset_t saved_sigs;
+	int swapped;
 
 	for (i = 0; i < ctx->nkeys; i++) {
 		if (!ctx->keys_verified[i])
@@ -2341,8 +2388,10 @@ update_known_hosts(struct hostkeys_update_ctx *ctx)
 		response = NULL;
 		for (i = 0; !quit_pending && i < 3; i++) {
 			free(response);
+			swapped = client_sigmask_begin(&saved_sigs);
 			response = read_passphrase("Accept updated hostkeys? "
 			    "(yes/no): ", RP_ECHO);
+			client_sigmask_end(swapped, &saved_sigs);
 			if (response != NULL && strcasecmp(response, "yes") == 0)
 				break;
 			else if (quit_pending || response == NULL ||
@@ -2370,7 +2419,10 @@ update_known_hosts(struct hostkeys_update_ctx *ctx)
 	for (i = 0; i < options.num_user_hostfiles; i++) {
 		/*
 		 * NB. keys are only added to hostfiles[0], for the rest we
-		 * just delete the hostname entries.
+		 * just delete the hostname entries. If the keys could not be
+		 * written to hostfiles[0] then leave the remaining files
+		 * untouched, otherwise the host's existing entries there
+		 * would be deleted without being recorded anywhere.
 		 */
 		if (stat(options.user_hostfiles[i], &sb) != 0) {
 			if (errno == ENOENT) {
@@ -2381,6 +2433,8 @@ update_known_hosts(struct hostkeys_update_ctx *ctx)
 				    "inaccessible: %s",
 				    options.user_hostfiles[i], strerror(errno));
 			}
+			if (i == 0)
+				break;
 			continue;
 		}
 		if ((r = hostfile_replace_entries(options.user_hostfiles[i],
@@ -2390,6 +2444,8 @@ update_known_hosts(struct hostkeys_update_ctx *ctx)
 		    options.fingerprint_hash)) != 0) {
 			error_fr(r, "hostfile_replace_entries failed for %s",
 			    options.user_hostfiles[i]);
+			if (i == 0)
+				break;
 		}
 	}
 }
@@ -2712,16 +2768,18 @@ client_input_hostkeys(struct ssh *ssh)
 static void
 client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *_ctx) {
 	struct tcp_info local_tcp_info;
-	const u_char *blob;
+	const u_char *blob = NULL;
 	FILE *remfptr;
-	FILE *localfptr;
+	FILE *localfptr = NULL;
+	static int remote_open_failed, local_open_failed;
 	char remfilename[1024];
 	char localfilename[1024];
 	time_t now;
 	struct tm *info;
 	char timestamp[40];
 	char *metricsstring = NULL;
-	size_t tcpi_len, len = 0;
+	socklen_t tcpi_len;
+	size_t len = 0;
 	binn *metricsobj = NULL;
 	int r, kernel_version = 0;
 
@@ -2729,8 +2787,12 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 	info = localtime(&now);
 	strftime(timestamp, 40, "%d-%m-%Y %H:%M:%S", info);
 
-	/* malloc the string 1KB should be large enough */
-	metricsstring = malloc(1024);
+	/* the string 1KB should be large enough. It is zeroed so that it is
+	 * empty, and not garbage, if the object it is filled from is bad */
+	if ((metricsstring = calloc(1, 1024)) == NULL) {
+		error_f("could not allocate the metrics string");
+		return;
+	}
 
 	/* get the local socket information */
 	int sock_in = ssh_packet_get_connection_in(ssh);
@@ -2760,16 +2822,30 @@ client_process_request_metrics (struct ssh *ssh, int type, u_int32_t seq, void *
 
 	/* open the file handle to write the remote data*/
 	remfptr = fopen(remfilename, "a");
-	if (remfptr == NULL)
-		fatal("Error opening %s: %s", remfilename, strerror(errno));
+	if (remfptr == NULL) {
+		/* a metrics file that cannot be written is not worth
+		 * ending the session for. Say so once, not every poll */
+		if (!remote_open_failed)
+			error("Error opening %s: %s", remfilename, strerror(errno));
+		remote_open_failed = 1;
+		goto localonly;
+	}
 
 	/* read the entire packet string into blob
 	 * blob has to be a const uchar as that's what string_direct expects
-	 * we cast it as a void for the binn functions */
-	sshpkt_get_string_direct(ssh, &blob, &len);
-	if (len == 0) {
-		/* received no data. which is weird */
+	 * we cast it as a void for the binn functions. The server sent it,
+	 * so check it is a whole, well formed binn object before the binn
+	 * functions, which are given no size, read from it. */
+	if ((r = sshpkt_get_string_direct(ssh, &blob, &len)) != 0 ||
+	    len == 0) {
 		error("Received no remote metrics data. Continuing.");
+		fclose(remfptr);
+		goto localonly;
+	}
+	if (!metrics_blob_valid(blob, len)) {
+		error("Received bad remote metrics data. Continuing.");
+		fclose(remfptr);
+		goto localonly;
 	}
 
 	/* get the kernel version printing the header */
@@ -2800,18 +2876,25 @@ localonly:
 #else
 	/* open file handle for local data */
 	localfptr = fopen(localfilename, "a");
-	if(localfptr == NULL)
-		fatal("Error opening %s: %s", localfilename, strerror(errno));
+	if (localfptr == NULL) {
+		if (!local_open_failed)
+			error("Error opening %s: %s", localfilename, strerror(errno));
+		local_open_failed = 1;
+		goto out;
+	}
 
 	/* create the binn object*/
 	metricsobj = binn_object();
 	if (metricsobj == NULL) {
-		fatal("Could not create metrics object");
+		error("Could not create metrics object");
+		goto out;
 	}
 
-	tcpi_len = (size_t)sizeof(local_tcp_info);
+	/* the kernel fills in only what it knows, and tcpi_len is the length it sees */
+	memset(&local_tcp_info, 0, sizeof(local_tcp_info));
+	tcpi_len = sizeof(local_tcp_info);
 	if ((r = getsockopt(sock_in, IPPROTO_TCP, TCP_INFO, (void *)&local_tcp_info,
-			    (socklen_t *)&tcpi_len)) != 0){
+			    &tcpi_len)) != 0){
 		error("Could not read tcp_info from socket");
 		goto out;
 	}
@@ -2833,9 +2916,12 @@ localonly:
 
 	fprintf(localfptr, "%s, ", timestamp);
 	fprintf(localfptr, "%s\n", metricsstring);
-	fclose (localfptr);
 #endif /* TCP_INFO */
 out:
+	if (localfptr != NULL)
+		fclose(localfptr);
+	if (metricsobj != NULL)
+		binn_free(metricsobj);
 	free(metricsstring);
 }
 

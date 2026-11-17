@@ -33,8 +33,8 @@
 .\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 .\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 .\"
-.\" $OpenBSD: sshd_config.5,v 1.410 2026/09/17 15:32:07 schwarze Exp $
-.Dd $Mdocdate: September 17 2026 $
+.\" $OpenBSD: sshd_config.5,v 1.412 2026/10/30 07:02:23 djm Exp $
+.Dd $Mdocdate: October 30 2026 $
 .Dt HPNSSHD_CONFIG 5
 .Os
 .Sh NAME
@@ -677,6 +677,14 @@ connection alongside trusted traffic, then compression may leak information
 about session contents.
 For this reason, it is not recommended to enable compression for connections
 that share trusted and untrusted traffic.
+.Pp
+A client that offers the method
+.Cm huff0@hpnssh.org
+will be given it in preference to zlib.
+It codes each packet on its own with Huffman coding and keeps no dictionary,
+so it does not have the weakness that led OpenSSH to restrict zlib to
+Huffman coding only.
+It is several times faster than zlib in that mode and compresses no better.
 .It Cm DenyGroups
 This keyword can be followed by a list of group name patterns, separated
 by spaces.
@@ -725,6 +733,13 @@ simplify restricted configurations.
 Switch the encryption cipher being used from the multithreaded MT-AES-CTR cipher
 back to the stock single-threaded AES-CTR cipher. Default is 
 .Cm no. HPNSSH only. 
+It affects only the AES-CTR cipher. The multithreaded ChaCha20-Poly1305 cipher
+is used when
+.Cm chacha20-poly1305-mt@hpnssh.org
+is in
+.Cm Ciphers
+and the client chooses ChaCha20-Poly1305; to keep the serial cipher, leave that name out of
+.Cm Ciphers .
 .It Cm ExposeAuthInfo
 Writes a temporary file containing a list of authentication methods and
 public credentials (e.g. keys) used to authenticate the user.
@@ -851,7 +866,7 @@ sk-ssh-ed25519@openssh.com,
 sk-ecdsa-sha2-nistp256@openssh.com,
 webauthn-sk-ecdsa-sha2-nistp256@openssh.com,
 rsa-sha2-512,rsa-sha2-256,
-ssh-mldsa44-ed2551
+ssh-mldsa44-ed25519
 .Ed
 .Pp
 The list of available signature algorithms may also be obtained using
@@ -2338,8 +2353,9 @@ A literal
 .Sq % .
 .It \&%C
 Identifies the connection endpoints, containing
-four space-separated values: client address, client port number,
-server address, and server port number.
+four space-separated values:
+server address, server port number,
+client address and client port number,
 .It \&%D
 The routing domain in which the incoming connection was received.
 .It %F

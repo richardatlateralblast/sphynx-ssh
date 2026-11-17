@@ -38,6 +38,7 @@ typedef struct tcp_info {
 #endif
 
 void metrics_write_binn_object(struct tcp_info *, struct binn_struct *);
+int metrics_blob_valid(const void *, size_t);
 void metrics_read_binn_object(void *, char *);
 void metrics_print_header(FILE *, char *, int);
 

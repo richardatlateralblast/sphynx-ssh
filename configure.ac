@@ -53,17 +53,11 @@ AC_CHECK_TOOLS([AR], [ar])
 AC_PATH_PROG([CAT], [cat])
 AC_PATH_PROG([KILL], [kill])
 AC_PATH_PROG([SED], [sed])
-AC_PATH_PROG([TEST_MINUS_S_SH], [bash])
-AC_PATH_PROG([TEST_MINUS_S_SH], [ksh])
-AC_PATH_PROG([TEST_MINUS_S_SH], [sh])
-AC_PATH_PROG([SH], [bash])
-AC_PATH_PROG([SH], [ksh])
-AC_PATH_PROG([SH], [sh])
+AC_PATH_PROGS([POSIX_SHELL], [bash ksh sh])
 AC_PATH_PROG([GROFF], [groff])
 AC_PATH_PROGS([NROFF], [nroff awf])
 AC_PATH_PROG([MANDOC], [mandoc])
 AC_PATH_TOOL([PKGCONFIG], [pkg-config], [no])
-AC_SUBST([TEST_SHELL], [sh])
 
 dnl select manpage formatter to be used to build "cat" format pages.
 if test "x$MANDOC" != "x" ; then
@@ -201,6 +195,7 @@ if test "$GCC" = "yes" || test "$GCC" = "egcs"; then
 	OSSH_CHECK_CFLAG_COMPILE([-pipe])
 	OSSH_CHECK_CFLAG_COMPILE([-Wunknown-warning-option])
 	OSSH_CHECK_CFLAG_COMPILE([-Wno-error=discarded-qualifiers])
+	OSSH_CHECK_CFLAG_COMPILE([-Wno-error=incompatible-pointer-types-discards-qualifiers])
 	OSSH_CHECK_CFLAG_COMPILE([-Wno-error=format-truncation])
 	OSSH_CHECK_CFLAG_COMPILE([-Qunused-arguments])
 	OSSH_CHECK_CFLAG_COMPILE([-Wall])
@@ -487,6 +482,7 @@ AC_CHECK_HEADERS([ \
 	maillock.h \
 	ndir.h \
 	net/if_tun.h \
+	net/tun/if_tun.h \
 	netdb.h \
 	pam/pam_appl.h \
 	pty.h \
@@ -862,6 +858,15 @@ int main(void) { if (NSVersionOfRunTimeLibrary("System") >= (60 << 16))
 *-*-dragonfly*)
 	SSHDLIBS="$SSHDLIBS"
 	TEST_MALLOC_OPTIONS="AFGJPRX"
+	AC_DEFINE([LOCKED_PASSWD_PREFIX], ["*LOCKED*"], [Account locked with pw(1)])
+	AC_DEFINE([SSH_TUN_FREEBSD], [1], [Open tunnel devices the FreeBSD way])
+	AC_DEFINE([SSH_TUN_COMPAT_AF], [1],
+	    [Use tunnel device compatibility to OpenBSD])
+	# DragonFly doesn't have "struct lastlog" but supports utmpx similar to
+	# FreeBSD.
+	SKIP_DISABLE_LASTLOG_DEFINE=yes
+	# DragonFly uses UTX_DB_LASTLOGX for setutxdb() to get lastlog entries.
+	CFLAGS="$CFLAGS -DUTXDB_LASTLOGIN=UTX_DB_LASTLOGX"
 	;;
 *-*-haiku*)
 	LIBS="$LIBS -lbsd "
@@ -1137,6 +1142,7 @@ mips-sony-bsd|mips-sony-newsos4)
 	TEST_MALLOC_OPTIONS="AJRX"
 	;;
 *-*-freebsd*)
+	SKIP_DISABLE_LASTLOG_DEFINE=yes
 	AC_DEFINE([LOCKED_PASSWD_PREFIX], ["*LOCKED*"], [Account locked with pw(1)])
 	AC_DEFINE([SSH_TUN_FREEBSD], [1], [Open tunnel devices the FreeBSD way])
 	AC_DEFINE([SSH_TUN_COMPAT_AF], [1],
@@ -1271,7 +1277,6 @@ if (setsockopt(s, IPPROTO_IP, IP_TOS, &one, sizeof(one)) == -1)
 		fi
 		],
 	)
-	TEST_SHELL=$SHELL	# let configure find us a capable shell
 	;;
 *-*-sunos4*)
 	CPPFLAGS="$CPPFLAGS -DSUNOS4"
@@ -1316,7 +1321,6 @@ if (setsockopt(s, IPPROTO_IP, IP_TOS, &one, sizeof(one)) == -1)
 	AC_DEFINE([BROKEN_SETREGID])
 	AC_DEFINE([PASSWD_NEEDS_USERNAME], [1], [must supply username to passwd])
 	AC_DEFINE([LOCKED_PASSWD_STRING], ["*LK*"])
-	TEST_SHELL=$SHELL	# let configure find us a capable shell
 	;;
 # UnixWare 7.x, OpenUNIX 8
 *-*-sysv5*)
@@ -1329,7 +1333,6 @@ if (setsockopt(s, IPPROTO_IP, IP_TOS, &one, sizeof(one)) == -1)
 	AC_DEFINE([BROKEN_SETREGID])
 	AC_DEFINE([PASSWD_NEEDS_USERNAME])
 	AC_DEFINE([BROKEN_TCGETATTR_ICANON])
-	TEST_SHELL=$SHELL	# let configure find us a capable shell
 	case "$host" in
 	*-*-sysv5SCO_SV*)	# SCO OpenServer 6.x
 		maildir=/var/spool/mail
@@ -1369,7 +1372,6 @@ if (setsockopt(s, IPPROTO_IP, IP_TOS, &one, sizeof(one)) == -1)
 	AC_DEFINE([PASSWD_NEEDS_USERNAME])
 	AC_CHECK_FUNCS([getluid setluid])
 	MANTYPE=man
-	TEST_SHELL=$SHELL	# let configure find us a capable shell
 	SKIP_DISABLE_LASTLOG_DEFINE=yes
 	;;
 *-dec-osf*)
@@ -3418,6 +3420,17 @@ if test "x$openssl" = "xyes" ; then
 	aws-lc|boringssl)
 		# Brainpool does not work with AWC-LS or BoringSSL.
 		unsupported_algorithms="$unsupported_algorithms mlkem768brainpoolp256r1-sha256"
+
+		# BoringSSL removed these in exports in commit 625475f
+		# Assume they are no larger than they were when removed.
+		AC_CHECK_DECL([OPENSSL_RSA_SMALL_MODULUS_BITS], [],
+		    AC_DEFINE([OPENSSL_RSA_SMALL_MODULUS_BITS], [3072],
+			[BoringSSL/AWS-LC does not provide this]),
+		    [[#include <openssl/rsa.h>]])
+		AC_CHECK_DECL([OPENSSL_RSA_MAX_PUBEXP_BITS], [],
+		    AC_DEFINE([OPENSSL_RSA_MAX_PUBEXP_BITS], [64],
+			[BoringSSL/AWS-LC does not provide this]),
+		    [[#include <openssl/rsa.h>]])
 		;;
 	*)
 		AC_CHECK_DECL([NID_brainpoolP256r1],
@@ -3631,7 +3644,7 @@ AC_ARG_WITH([prngd-socket],
 			AC_MSG_CHECKING([for PRNGD/EGD socket])
 			# Insert other locations here
 			for sock in /var/run/egd-pool /dev/egd-pool /etc/entropy; do
-				if test -r $sock && $TEST_MINUS_S_SH -c "test -S $sock -o -p $sock" ; then
+				if test -r $sock && $POSIX_SHELL -c "test -S $sock -o -p $sock" ; then
 					PRNGD_SOCKET="$sock"
 					AC_DEFINE_UNQUOTED([PRNGD_SOCKET], ["$PRNGD_SOCKET"])
 					break;
@@ -5783,7 +5796,9 @@ dnl wtmpx detection
 AC_MSG_CHECKING([if your system defines WTMPX_FILE])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
 #include <sys/types.h>
+#ifdef HAVE_UTMP_H
 #include <utmp.h>
+#endif
 #ifdef HAVE_UTMPX_H
 #include <utmpx.h>
 #endif
@@ -5882,6 +5897,7 @@ CFLAGS_NOPIE=`echo "$CFLAGS" | sed 's/^-fPIE //;s/ -fPIE//g'`
 AC_SUBST([LDFLAGS_NOPIE])
 AC_SUBST([CFLAGS_NOPIE])
 AC_SUBST([COMPATINCLUDES])
+AC_SUBST([POSIX_SHELL])
 
 AC_EXEEXT
 AC_CONFIG_FILES([Makefile buildpkg.sh opensshd.init openssh.xml \

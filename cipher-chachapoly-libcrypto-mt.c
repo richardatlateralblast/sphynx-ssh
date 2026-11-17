@@ -97,6 +97,7 @@ struct chachapoly_ctx_mt {
 	pthread_t self_tid;
 
 	pid_t mainpid;
+	u_int fork_gen;	/* mt_fork_gen when the threads above were started */
 	u_char zeros[KEYSTREAMLEN]; /* KEYSTREAMLEN == 32768 */
 
   /* if OpenSSL has support for Poly1305 in the MAC EVPs
@@ -220,6 +221,70 @@ worker_thread(struct worker_thread_args * args)
 
 	args->retval = 0;
 	return args;
+}
+
+/*
+ * fork() copies only the calling thread. After a fork the manager threads the
+ * parent started do not exist in the child, so the child must not join them,
+ * and the keystream they were making is never finished. A handler registered
+ * with pthread_atfork() counts the forks in the child; a context made before
+ * the latest one repairs itself before it is used (see mt_check_fork()).
+ */
+static volatile u_int mt_fork_gen;
+static pthread_once_t mt_fork_once = PTHREAD_ONCE_INIT;
+
+static void
+mt_fork_child(void)
+{
+	mt_fork_gen++;
+}
+
+static void
+mt_fork_register(void)
+{
+	(void)pthread_atfork(NULL, NULL, mt_fork_child);
+}
+
+/*
+ * Make a context that was copied by fork() usable in the child: forget the
+ * threads, which are not here, and make the keystream for the current batch
+ * and the next again, from the key held in the first thread data. Returns 0 on
+ * success.
+ */
+static int
+mt_repair_after_fork(struct chachapoly_ctx_mt *ctx_mt)
+{
+	u_int k, j, id;
+
+	debug_f("forked: regenerating the keystream in pid %u", (u_int)getpid());
+	ctx_mt->mainpid = getpid();
+	ctx_mt->self_tid = pthread_self();
+	ctx_mt->manager_tid[0] = ctx_mt->self_tid;
+	ctx_mt->manager_tid[1] = ctx_mt->self_tid;
+	ctx_mt->fork_gen = mt_fork_gen;
+	for (k = 0; k < 2; k++) {
+		struct mt_keystream_batch *batch;
+
+		id = ctx_mt->batchID + k;
+		batch = &(ctx_mt->batches[id % 2]);
+		for (j = 0; j < NUMSTREAMS; j++) {
+			if (generate_keystream(&(batch->streams[j]),
+			    id * NUMSTREAMS + j, &(batch->tds[0]),
+			    ctx_mt->zeros) == -1)
+				return -1;
+		}
+		batch->batchID = id;
+	}
+	return 0;
+}
+
+/* Called before the context is used: repair it if this process is a fork */
+static inline int
+mt_check_fork(struct chachapoly_ctx_mt *ctx_mt)
+{
+	if (unlikely(ctx_mt->fork_gen != mt_fork_gen))
+		return mt_repair_after_fork(ctx_mt);
+	return 0;
 }
 
 int
@@ -390,6 +455,8 @@ chachapoly_new_mt(u_int startseqnr, const u_char * key, u_int keylen)
 	}
 
 	/* Store the PID so that in the future, we can tell if we're a fork */
+	(void)pthread_once(&mt_fork_once, mt_fork_register);
+	ctx_mt->fork_gen = mt_fork_gen;
 	ctx_mt->mainpid = getpid();
 	ctx_mt->self_tid = pthread_self();
 	ctx_mt->manager_tid[0] = ctx_mt->self_tid;
@@ -566,6 +633,9 @@ chachapoly_crypt_mt(struct chachapoly_ctx_mt *ctx_mt, u_int seqnr, u_char *dest,
 	}
 #endif
 
+	if (mt_check_fork(ctx_mt) != 0)
+		return SSH_ERR_INTERNAL_ERROR;
+
 	pthread_t * manager_tid = &(ctx_mt->manager_tid[ctx_mt->batchID % 2]);
 	if (unlikely(*manager_tid != ctx_mt->self_tid)) {
 		int ret = join_manager_thread(*manager_tid);
@@ -691,6 +761,9 @@ chachapoly_get_length_mt(struct chachapoly_ctx_mt *ctx_mt, u_int *plenp,
 
 	if (len < 4)
 		return SSH_ERR_MESSAGE_INCOMPLETE;
+
+	if (mt_check_fork(ctx_mt) != 0)
+		return SSH_ERR_INTERNAL_ERROR;
 
 	pthread_t * manager_tid = &(ctx_mt->manager_tid[ctx_mt->batchID % 2]);
 	if (unlikely(*manager_tid != ctx_mt->self_tid)) {

@@ -18,6 +18,7 @@
 #include "includes.h"
 #include "metrics.h"
 #include "ssherr.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -244,6 +245,21 @@ metrics_write_binn_object(struct tcp_info *data, struct binn_struct *binnobj) {
 #endif /*endif for TCP_INFO */
 }
 
+/* The binn functions that read a value take no size, so a blob that came from
+ * the peer must be checked before any of them is called. This is true when
+ * the blob is one whole binn object of exactly len bytes, and every key and
+ * value in it lies inside it. */
+int
+metrics_blob_valid(const void *blob, size_t len)
+{
+	int size;
+
+	if (blob == NULL || len == 0 || len > INT_MAX)
+		return 0;
+	size = (int)len;
+	return binn_is_valid_ex(blob, NULL, NULL, &size) ? 1 : 0;
+}
+
 /* this reads out the tcp_info binn object and formats it into a single line
  * the object will not necessarily have all of the elements. If it's empty it
  * current just spits out 0. This isn't optimal as 0 can also be a valid value */
@@ -252,6 +268,9 @@ metrics_read_binn_object (void *binnobj, char *output) {
 	int len = 0;
 	int buflen = 1023;
 	int kernel_version = 0;
+	/* leave the caller an empty string, not whatever was in its buffer, if
+	 * there is nothing to format */
+	output[0] = '\0';
 	if (binnobj == NULL) {
 		fprintf(stderr, "Metric polling returned bad data.\n");
 		return;

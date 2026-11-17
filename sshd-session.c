@@ -368,6 +368,59 @@ privsep_preauth(struct ssh *ssh)
 	}
 }
 
+/*
+ * The key exchange proposal is made before the user is known, with "none"
+ * added to the ciphers and MACs when NoneEnabled and NoneMacEnabled are on
+ * in the global configuration. A Match block for the user can turn either off,
+ * but nothing looked at the result: the proposal still named "none", and the
+ * client could switch to it after login. Now that the options include the
+ * Match blocks, take "none" out of the proposal again where it is not allowed.
+ */
+static void
+restrict_none_proposal(struct ssh *ssh)
+{
+	char **prop = NULL;
+	int r, change = 0;
+
+	if (options.none_enabled == 1 && options.nonemac_enabled == 1)
+		return;
+	if (ssh->kex == NULL || ssh->kex->my == NULL)
+		return;
+	if ((r = kex_buf2prop(ssh->kex->my, NULL, &prop)) != 0) {
+		error_fr(r, "kex_buf2prop");
+		return;
+	}
+	if (options.none_enabled != 1) {
+		int i;
+
+		for (i = PROPOSAL_ENC_ALGS_CTOS; i <= PROPOSAL_ENC_ALGS_STOC; i++) {
+			char *f = match_filter_denylist(prop[i], "none");
+
+			if (f == NULL)
+				fatal_f("match_filter_denylist failed");
+			free(prop[i]);
+			prop[i] = f;
+		}
+		change = 1;
+	}
+	if (options.none_enabled != 1 || options.nonemac_enabled != 1) {
+		int i;
+
+		for (i = PROPOSAL_MAC_ALGS_CTOS; i <= PROPOSAL_MAC_ALGS_STOC; i++) {
+			char *f = match_filter_denylist(prop[i], "none");
+
+			if (f == NULL)
+				fatal_f("match_filter_denylist failed");
+			free(prop[i]);
+			prop[i] = f;
+		}
+		change = 1;
+	}
+	if (change && (r = kex_prop2buf(ssh->kex->my, prop)) != 0)
+		fatal_fr(r, "kex_prop2buf");
+	kex_prop_free(prop);
+}
+
 static void
 privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
 {
@@ -404,6 +457,9 @@ privsep_postauth(struct ssh *ssh, Authctxt *authctxt)
 
 	/* It is safe now to apply the key state */
 	monitor_apply_keystate(ssh, pmonitor);
+
+	/* the key state has the proposal; the Match blocks have been applied */
+	restrict_none_proposal(ssh);
 
 	/*
 	 * Tell the packet layer that authentication was successful, since
@@ -707,6 +763,12 @@ check_ip_options(struct ssh *ssh)
 	if (getpeername(sock_in, (struct sockaddr *)&from,
 	    &fromlen) == -1)
 		return;
+	/*
+	 * IPv4 clients of a dual-stack socket (e.g. inherited via sshd -i)
+	 * appear as IPv4-mapped IPv6 addresses; they are still IPv4
+	 * connections and can carry IPv4 options, so check them too.
+	 */
+	ipv64_normalise_mapped(&from, &fromlen);
 	if (from.ss_family != AF_INET)
 		return;
 	/* XXX IPv6 options? */

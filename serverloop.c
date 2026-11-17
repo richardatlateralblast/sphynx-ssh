@@ -1,4 +1,4 @@
-/* $OpenBSD: serverloop.c,v 1.248 2026/07/14 01:05:05 djm Exp $ */
+/* $OpenBSD: serverloop.c,v 1.250 2026/10/30 05:16:48 djm Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -397,14 +397,11 @@ server_loop2(struct ssh *ssh, Authctxt *authctxt)
 	collect_children(ssh);
 	free(pfd);
 
-	/* write final log entry (do we need this here? -cjr)*/
-	sshpkt_final_log_entry(ssh);
-
 	/* free all channels, no more reads and writes */
 	channel_free_all(ssh);
 
 	/* final entry must come after channels close -cjr */
-        sshpkt_final_log_entry(ssh);
+	sshpkt_final_log_entry(ssh);
 
 	/* free remaining sessions, e.g. remove wtmp entries */
 	session_destroy_all(ssh, NULL);
@@ -458,8 +455,10 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
 		c = channel_connect_to_port(ssh, target, target_port,
 		    "direct-tcpip", "direct-tcpip", reason, errmsg);
 	} else {
-		logit("refused local port forward: "
-		    "originator %s port %d, target %s port %d",
+		do_log2(channel_fwd_refusal_ratelimited(ssh) ?
+		    SYSLOG_LEVEL_DEBUG1 : SYSLOG_LEVEL_INFO,
+		    "refused local port forward: "
+		    "originator %.100s port %d, target %.100s port %d",
 		    originator, originator_port, target, target_port);
 		if (reason != NULL)
 			*reason = SSH2_OPEN_ADMINISTRATIVELY_PROHIBITED;
@@ -503,8 +502,10 @@ server_request_direct_streamlocal(struct ssh *ssh)
 		c = channel_connect_to_path(ssh, target,
 		    "direct-streamlocal@openssh.com", "direct-streamlocal");
 	} else {
-		logit("refused streamlocal port forward: "
-		    "originator %s port %d, target %s",
+		do_log2(channel_fwd_refusal_ratelimited(ssh) ?
+		    SYSLOG_LEVEL_DEBUG1 : SYSLOG_LEVEL_INFO,
+		    "refused streamlocal port forward: "
+		    "originator %.100s port %d, target %.100s",
 		    originator, originator_port, target);
 	}
 
@@ -556,9 +557,8 @@ server_request_tun(struct ssh *ssh)
 		goto done;
 	debug("Tunnel forwarding using interface %s", ifname);
 
-	c = channel_new(ssh, "tun", SSH_CHANNEL_OPEN, sock, sock, -1,
-			CHAN_TCP_WINDOW_DEFAULT, CHAN_TCP_PACKET_DEFAULT,
-			0, "tun", 1);
+	c = channel_new(ssh, "tun-connection", SSH_CHANNEL_OPEN, sock, sock, -1,
+	    CHAN_TCP_WINDOW_DEFAULT, CHAN_TCP_PACKET_DEFAULT, 0, "tun", 1);
 	c->datagram = 1;
 #if defined(SSH_TUN_FILTER)
 	if (mode == SSH_TUNMODE_POINTOPOINT)
@@ -698,12 +698,14 @@ server_input_metrics_request(struct ssh *ssh, struct sshbuf **respp)
 #else
         struct tcp_info tcp_info;
 	struct sshbuf *resp = NULL;
-	int tcp_info_len;
+	socklen_t tcp_info_len;
 	/* this is the socket of the current connection */
 	int sock_in = ssh_packet_get_connection_in(ssh);
 	int r;
 	binn *metricsobj;
 
+	/* the kernel fills in only what it knows; do not send the rest as it is on the stack */
+	memset(&tcp_info, 0, sizeof(tcp_info));
 	tcp_info_len = sizeof(tcp_info); /*expect around 330 bytes */
 	if ((resp = sshbuf_new()) == NULL)
 		fatal_f("sshbuf_new");
@@ -717,7 +719,7 @@ server_input_metrics_request(struct ssh *ssh, struct sshbuf **respp)
 
 	debug("Stack metrics request for connection %d", sock_in);
 	if ((r = getsockopt(sock_in, IPPROTO_TCP, TCP_INFO, (void *)&tcp_info,
-			   (socklen_t *)&tcp_info_len)) != 0) {
+			   &tcp_info_len)) != 0) {
 		error_f("Could not read tcp_info from socket");
 		goto out;
 	}

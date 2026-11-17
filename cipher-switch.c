@@ -47,6 +47,18 @@ cipher_switch(struct ssh *ssh) {
 	const char *recv = cipher_ctx_name(recv_cc);
 
 	debug_f("Send: %s Recv: %s", send, recv);
+
+	/*
+	 * This is called for every session channel that is started. The
+	 * switch is made once per connection: the multithreaded AES-CTR
+	 * context keeps the plain cipher name, so without this every extra
+	 * session on a multiplexed connection asked for another rekey, and
+	 * the sessions already running stalled behind each one.
+	 */
+	if (ssh->mt_enabled) {
+		debug_f("already switched");
+		return;
+	}
 	
 	/* if the name of the cipher matches then we set the context
 	 * to authenticated (it likely already is though) and then
@@ -70,6 +82,7 @@ cipher_switch(struct ssh *ssh) {
 	if ((strcmp(send, "chacha20-poly1305@openssh.com") == 0) ||
 	    (strcmp(recv, "chacha20-poly1305@openssh.com") == 0)) {
 		debug("Serial to parallel Chacha20-poly1305 cipher swap");
+		ssh->mt_enabled = 1;
 		ssh_packet_set_authenticated(ssh);
 		packet_request_rekeying();
 	}

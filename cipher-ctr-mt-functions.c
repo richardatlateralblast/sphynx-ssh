@@ -29,6 +29,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <openssl/evp.h>
+#include <stddef.h>
+
 #include "xmalloc.h"
 #include <unistd.h>
 #include "cipher-ctr-mt-functions.h"
@@ -126,6 +128,19 @@ static void
 stop_and_join_pregen_threads(struct aes_mt_ctx_st *aes_mt_ctx)
 {
 	int i;
+
+	/*
+	 * A forked child has a copy of this context but not its threads: fork()
+	 * keeps only the calling thread. Cancelling and joining threads that
+	 * are not there waits for ever, and a lock one of them held when the
+	 * fork happened is held for good. The session child that sshd forks to
+	 * run a command has to free this context before it execs, and with a
+	 * second session on a connection that is what hung.
+	 */
+	if (aes_mt_ctx->pid != 0 && aes_mt_ctx->pid != getpid()) {
+		aes_mt_ctx->running = 0;
+		return;
+	}
 
 	/* notify threads that they should exit */
 	pthread_rwlock_wrlock(&aes_mt_ctx->stop_lock);
@@ -384,19 +399,37 @@ void aes_mt_freectx(void *vevp_ctx)
 {
 	EVP_CIPHER_CTX *evp_ctx = vevp_ctx;
 	struct aes_mt_ctx_st *aes_mt_ctx;
-	int i;
+	size_t used;
+	int i, forked;
 
 	if ((aes_mt_ctx = EVP_CIPHER_CTX_get_app_data(evp_ctx)) != NULL) {
+		forked = aes_mt_ctx->pid != 0 && aes_mt_ctx->pid != getpid();
 		stop_and_join_pregen_threads(aes_mt_ctx);
 
-		/* All threads are joined, so nothing can use the locks now */
-		for (i = 0; i < aes_mt_ctx->numkq; i++) {
-			pthread_mutex_destroy(&aes_mt_ctx->q[i].lock);
-			pthread_cond_destroy(&aes_mt_ctx->q[i].cond);
+		/*
+		 * All threads are joined, so nothing can use the locks now. In
+		 * a forked child a lock may be held by a thread that is not
+		 * here, and destroying it is undefined, so leave them.
+		 */
+		if (!forked) {
+			for (i = 0; i < aes_mt_ctx->numkq; i++) {
+				pthread_mutex_destroy(&aes_mt_ctx->q[i].lock);
+				pthread_cond_destroy(&aes_mt_ctx->q[i].cond);
+			}
+			pthread_rwlock_destroy(&aes_mt_ctx->stop_lock);
 		}
-		pthread_rwlock_destroy(&aes_mt_ctx->stop_lock);
 
-		explicit_bzero(aes_mt_ctx, sizeof(*aes_mt_ctx));
+		/*
+		 * Clear what held key material, and keystream. The context
+		 * has room for MAX_NUMKQ queues of 512 KiB (17 MB) but only
+		 * numkq were used, and the rest are still the zero pages
+		 * calloc() gave us: clearing them would touch every one.
+		 */
+		used = aes_mt_ctx->numkq * sizeof(aes_mt_ctx->q[0]);
+		explicit_bzero(aes_mt_ctx, offsetof(struct aes_mt_ctx_st, q));
+		explicit_bzero(aes_mt_ctx->q, used);
+		explicit_bzero((u_char *)aes_mt_ctx + offsetof(struct aes_mt_ctx_st, stop_lock),
+		    sizeof(*aes_mt_ctx) - offsetof(struct aes_mt_ctx_st, stop_lock));
 		free(aes_mt_ctx);
 		EVP_CIPHER_CTX_set_app_data(evp_ctx, NULL);
 	}
@@ -508,6 +541,7 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
 			    &aes_mt_ctx->job[i]) != 0)
 				fatal("AES-CTR MT Could not create thread in %s", __func__);
 			aes_mt_ctx->running++;
+			aes_mt_ctx->pid = getpid();
 			debug_f("AES-CTR MT spawned a thread with id %lu (%lu, %d)",
 			    aes_mt_ctx->tid[i], aes_mt_ctx->struct_id, aes_mt_ctx->id[i]);
 		}
@@ -522,6 +556,30 @@ int aes_mt_start_threads(void *vevp_ctx, const u_char *key,
 	return 1;
 }
 
+/* XOR len bytes of the keystream (key) into src, writing dest. len is a
+ * multiple of AES_BLOCK_SIZE. The loads and stores go through memcpy, so no
+ * alignment is needed and there is no aliasing UB, and the loop is simple
+ * enough for the compiler to vectorise. dest may equal src. */
+static inline void
+xor_keystream(u_char *dest, const u_char *src, const u_char *key, size_t len)
+{
+	size_t i;
+	uint64_t a[4], k[4];
+
+	for (i = 0; i + 32 <= len; i += 32) {
+		memcpy(a, src + i, 32);
+		memcpy(k, key + i, 32);
+		a[0] ^= k[0]; a[1] ^= k[1]; a[2] ^= k[2]; a[3] ^= k[3];
+		memcpy(dest + i, a, 32);
+	}
+	for (; i < len; i += 16) {
+		memcpy(a, src + i, 16);
+		memcpy(k, key + i, 16);
+		a[0] ^= k[0]; a[1] ^= k[1];
+		memcpy(dest + i, a, 16);
+	}
+}
+
 /* this should correspond to ssh_aes_ctr
  * OSSL_CORE_MAKE_FUNC(int, cipher_cipher,
  *                     (void *cctx,
@@ -533,25 +591,12 @@ int aes_mt_do_cipher(void *vevp_ctx,
 			    u_char *dest, size_t *destlen, size_t destsize,
 			    const u_char *src, size_t len)
 {
-	typedef union {
-#ifdef CIPHER_INT128_OK
-		__uint128_t *u128;
-#endif
-		uint64_t *u64;
-		uint32_t *u32;
-		uint8_t *u8;
-		const uint8_t *cu8;
-		uintptr_t u;
-	} ptrs_t;
-	ptrs_t destp, srcp, bufp;
-	uintptr_t align;
 	struct aes_mt_ctx_st *aes_mt_ctx;
 	struct kq *q, *oldq;
 	int ridx;
-	u_char *buf;
 	EVP_CIPHER_CTX *evp_ctx = vevp_ctx;
-	uint64_t src_a, key_a;
-	
+	size_t blocks, n;
+
 	if (len == 0)
 		return 1;
 
@@ -562,70 +607,22 @@ int aes_mt_do_cipher(void *vevp_ctx,
 	ridx = aes_mt_ctx->ridx;
 
 	/* src already padded to block multiple */
-	srcp.cu8 = src;
-	destp.u8 = dest;
 	do { /* do until len is 0 */
-		buf = q->keys[ridx];
-		bufp.u8 = buf;
-
-		/* figure out the alignment on the fly */
-#ifdef CIPHER_UNALIGNED_OK
-		align = 0;
-#else
-		align = destp.u | srcp.u | bufp.u;
-#endif
-
-		/* xor the src against the key (buf)
-		 * different systems can do all 16 bytes at once or
-		 * may need to do it in 8 or 4 bytes chunks
-		 * worst case is doing it as a loop */
-#ifdef CIPHER_INT128_OK
-		/* with GCC 13 we have having consistent seg faults
-		 * in this section of code. Since this is a critical
-		 * code path we are removing this until we have a solution
-		 * in place -cjr 02/22/24
-		 * TODO: FIX THIS
-		 */
-		/* if ((align & 0xf) == 0) { */
-		/* 	destp.u128[0] = srcp.u128[0] ^ bufp.u128[0]; */
-		/* } else */
-#endif
-		/* 64 bits */
-		/* this is causing undefined behaviour in sanitizers
-		 * this is annoying because it's more efficient
-		 * but UB is not something I want to retain */
-		if ((align & 0x7) == 0) {
-			/* this should resolve the strict aliasing UB
-			 * and the performance doesn't seem to change much
-			 * but the memcpys are killing me 3-5-26 cjr*/
-			memcpy(&src_a, &srcp.u64[0], sizeof(uint64_t));
-			memcpy(&key_a, &bufp.u64[0], sizeof(uint64_t));
-			destp.u64[0] = src_a ^ key_a;
-			memcpy(&src_a, &srcp.u64[1], sizeof(uint64_t));
-			memcpy(&key_a, &bufp.u64[1], sizeof(uint64_t));
-			destp.u64[1] = src_a ^ key_a;
-			/* destp.u64[0] = srcp.u64[0] ^ bufp.u64[0]; */
-			/* destp.u64[1] = srcp.u64[1] ^ bufp.u64[1]; */
-                /* 32 bits */
-		} else
-		if ((align & 0x3) == 0) {
-			destp.u32[0] = srcp.u32[0] ^ bufp.u32[0];
-			destp.u32[1] = srcp.u32[1] ^ bufp.u32[1];
-			destp.u32[2] = srcp.u32[2] ^ bufp.u32[2];
-			destp.u32[3] = srcp.u32[3] ^ bufp.u32[3];
-		} else {
-			/*1 byte at a time*/
-			size_t i;
-			for (i = 0; i < AES_BLOCK_SIZE; ++i)
-				dest[i] = src[i] ^ buf[i];
-		}
-
-		/* inc/decrement the pointers by the block size (16)*/
-		destp.u += AES_BLOCK_SIZE;
-		srcp.u += AES_BLOCK_SIZE;
+		/* the keystream left in this queue is contiguous, so xor
+		 * as much of src as it covers in one pass */
+		blocks = (len + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE;
+		if (blocks > (size_t)(KQLEN - ridx))
+			blocks = KQLEN - ridx;
+		n = blocks * AES_BLOCK_SIZE;
+		xor_keystream(dest, src, q->keys[ridx], n);
+		dest += n;
+		src += n;
+		len = len > n ? len - n : 0;
 
 		/* Increment read index, switch queues on rollover */
-		if ((ridx = (ridx + 1) % KQLEN) == 0) {
+		ridx += blocks;
+		if (ridx == KQLEN) {
+			ridx = 0;
 			oldq = q;
 
 			/* Mark next queue draining, may need to wait */
@@ -645,7 +642,7 @@ int aes_mt_do_cipher(void *vevp_ctx,
 			pthread_cond_broadcast(&oldq->cond);
 			pthread_mutex_unlock(&oldq->lock);
 		}
-	} while (len -= AES_BLOCK_SIZE);
+	} while (len);
 	aes_mt_ctx->ridx = ridx;
 	return 1;
 }

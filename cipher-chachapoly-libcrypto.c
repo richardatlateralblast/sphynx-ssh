@@ -68,7 +68,10 @@ chachapoly_new(const u_char *key, u_int keylen)
 	EVP_MAC *mac = NULL;
 	if ((mac = EVP_MAC_fetch(NULL, "POLY1305", NULL)) == NULL)
 		goto fail;
-	if ((ctx->poly_ctx = EVP_MAC_CTX_new(mac)) == NULL)
+	ctx->poly_ctx = EVP_MAC_CTX_new(mac);
+	/* the context holds its own reference to the MAC; drop ours */
+	EVP_MAC_free(mac);
+	if (ctx->poly_ctx == NULL)
 		goto fail;
 #else
 	ctx->poly_ctx = NULL;

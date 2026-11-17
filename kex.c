@@ -1,4 +1,4 @@
-/* $OpenBSD: kex.c,v 1.196 2026/09/22 00:24:47 dtucker Exp $ */
+/* $OpenBSD: kex.c,v 1.198 2026/10/30 04:36:21 djm Exp $ */
 /*
  * Copyright (c) 2000, 2001 Markus Friedl.  All rights reserved.
  *
@@ -60,6 +60,7 @@
 #include "canohost.h"
 #include "digest.h"
 #include "xmalloc.h"
+#include "compress-huff0.h"
 
 /* prototype */
 static int kex_choose_conf(struct ssh *, uint32_t seq);
@@ -236,7 +237,7 @@ kex_protocol_error(int type, uint32_t seq, struct ssh *ssh)
 
 	/* If in strict mode, any unexpected message is an error */
 	if ((ssh->kex->flags & KEX_INITIAL) && ssh->kex->kex_strict) {
-		ssh_packet_disconnect(ssh, "strict KEX violation: "
+		return sshpkt_protocol_error(ssh, "strict KEX violation: "
 		    "unexpected packet type %u (seqnr %u)", type, seq);
 	}
 	error_f("type %u seq %u", type, seq);
@@ -676,7 +677,7 @@ kex_input_kexinit(int type, uint32_t seq, struct ssh *ssh)
 	free(kex->name);
 	kex->name = NULL;
 	if ((kex->flags & KEX_INIT_RECVD) != 0) {
-		ssh_packet_disconnect(ssh,
+		return sshpkt_protocol_error(ssh,
 		    "multiple KEXINIT received from peer");
 	}
 	kex->flags |= KEX_INIT_RECVD;
@@ -965,6 +966,9 @@ choose_comp(struct sshcomp *comp, char *client, char *server)
 
 	if (name == NULL)
 		return SSH_ERR_NO_COMPRESS_ALG_MATCH;
+	if (strcmp(name, COMP_HUFF0_NAME) == 0) {
+		comp->type = COMP_DELAYED;
+	} else
 #ifdef WITH_ZLIB
 	if (strcmp(name, "zlib@openssh.com") == 0) {
 		comp->type = COMP_DELAYED;
@@ -1064,6 +1068,10 @@ kex_choose_conf(struct ssh *ssh, uint32_t seq)
 	auth_flag = packet_authentication_state(ssh);
 	debug("AUTH STATE IS %d", auth_flag);
 
+	/* these describe this negotiation, not an earlier one */
+	ssh->none = 0;
+	ssh->none_mac = 0;
+
 	debug2("local %s KEXINIT proposal", kex->server ? "server" : "client");
 	if ((r = kex_buf2prop(kex->my, NULL, &my)) != 0)
 		goto out;
@@ -1092,10 +1100,12 @@ kex_choose_conf(struct ssh *ssh, uint32_t seq)
 		}
 		if (kex->kex_strict) {
 			debug3_f("will use strict KEX ordering");
-			if (seq != 0)
-				ssh_packet_disconnect(ssh,
+			if (seq != 0) {
+				r = sshpkt_protocol_error(ssh,
 				    "strict KEX violation: "
 				    "KEXINIT was not the first packet");
+				goto out;
+			}
 		}
 	}
 
@@ -1141,13 +1151,16 @@ kex_choose_conf(struct ssh *ssh, uint32_t seq)
 		}
 #ifdef WITH_OPENSSL
 		if ((strcmp(newkeys->enc.name, "chacha20-poly1305@openssh.com")
-		    == 0) && (match_list("chacha20-poly1305-mt@hpnssh.org",
-		    my[nenc], NULL) != NULL)) {
+		    == 0) && kex_has_any_alg(my[nenc],
+		    "chacha20-poly1305-mt@hpnssh.org")) {
 			/*
 			 * if we're using the serial CC20 cipher while the
 			 * multithreaded implementation is an option...
 			 */
 			free(newkeys->enc.name);
+			/* not left pointing at what was freed: the error path
+			 * below frees newkeys, name and all */
+			newkeys->enc.name = NULL;
 			newkeys->enc.cipher = cipher_by_name(
 			    "chacha20-poly1305-mt@hpnssh.org");
 			if (newkeys->enc.cipher == NULL) {
@@ -1166,12 +1179,37 @@ kex_choose_conf(struct ssh *ssh, uint32_t seq)
 #endif
 		authlen = cipher_authlen(newkeys->enc.cipher);
 		/* ignore mac for authenticated encryption */
-		if (authlen == 0 &&
-		    (r = choose_mac(ssh, &newkeys->mac, cprop[nmac],
-		    sprop[nmac])) != 0) {
-			kex->failed_choice = peer[nmac];
-			peer[nmac] = NULL;
-			goto out;
+		if (authlen == 0) {
+			char *cmac = cprop[nmac], *smac = sprop[nmac];
+			char *cfilt = NULL, *sfilt = NULL;
+
+			/*
+			 * The none MAC is for the none cipher after
+			 * authentication. With any other cipher, or before
+			 * authentication, it would leave the stream with no
+			 * integrity check, so it is not a choice.
+			 */
+			if (!(auth_flag == 1 &&
+			    strcmp(newkeys->enc.name, "none") == 0)) {
+				if ((cfilt = match_filter_denylist(cmac,
+				    "none")) == NULL ||
+				    (sfilt = match_filter_denylist(smac,
+				    "none")) == NULL) {
+					free(cfilt);
+					r = SSH_ERR_ALLOC_FAIL;
+					goto out;
+				}
+				cmac = cfilt;
+				smac = sfilt;
+			}
+			r = choose_mac(ssh, &newkeys->mac, cmac, smac);
+			free(cfilt);
+			free(sfilt);
+			if (r != 0) {
+				kex->failed_choice = peer[nmac];
+				peer[nmac] = NULL;
+				goto out;
+			}
 		}
 		if ((r = choose_comp(&newkeys->comp, cprop[ncomp],
 		    sprop[ncomp])) != 0) {
@@ -1424,6 +1462,8 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
     const char *version_addendum)
 {
 	int remote_major, remote_minor, mismatch, oerrno = 0;
+	int have_timeout = timeout_ms > 0;
+	struct timespec now, remain, deadline;
 	size_t len, n;
 	int r, expect_nl;
 	u_char c;
@@ -1433,6 +1473,13 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
 	    ssh->kex->client_version : ssh->kex->server_version;
 	char *our_version_string = NULL, *peer_version_string = NULL;
 	char *cp, *remote_version = NULL;
+
+	/* The timeout applies to the whole exchange, not to each read */
+	if (have_timeout) {
+		monotime_ts(&now);
+		ms_to_timespec(&remain, timeout_ms);
+		timespecadd(&now, &remain, &deadline);
+	}
 
 	/* Prepare and send our banner */
 	sshbuf_reset(our_version);
@@ -1481,7 +1528,11 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
 		sshbuf_reset(peer_version);
 		expect_nl = 0;
 		for (;;) {
-			if (timeout_ms > 0) {
+			if (have_timeout) {
+				ptimeout_init(&remain);
+				ptimeout_deadline_monotime_tsp(&remain,
+				    &deadline);
+				timeout_ms = ptimeout_get_ms(&remain);
 				r = waitrfd(ssh_packet_get_connection_in(ssh),
 				    &timeout_ms, NULL);
 				if (r == -1 && errno == ETIMEDOUT) {

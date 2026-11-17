@@ -115,6 +115,7 @@ struct aes_mt_ctx_st {
 	int                     threads;  /* pregen threads to start */
 	int                     numkq;    /* keystream queues: threads + 1 */
 	int                     running;  /* threads started and not yet joined */
+	pid_t                   pid;      /* process that started them */
 	int		        state;
 	int		        qidx;
 	int		        ridx;

@@ -467,6 +467,7 @@ void tolocal(int, char *[], enum scp_mode_e, char *sftp_direct);
 void toremote(int, char *[], enum scp_mode_e, char *sftp_direct);
 void usage(void);
 void calculate_hash(char *, char *, off_t); /*get the hash of file to length*/
+void calculate_hash_fd(int, char *, off_t); /* the same, of an open file */
 void rand_str(char *, size_t); /*gen randome char string */
 
 void source_sftp(int, char *, char *, struct sftp_conn *);
@@ -1360,7 +1361,13 @@ tolocal(int argc, char **argv, enum scp_mode_e mode, char *sftp_direct)
  * Note: LibreSSL doesn't support blake2b512 so we can't offer them
  * the resume feature cjr 7/18/2023 */
 #if (defined WITH_OPENSSL) && !defined(LIBRESSL_VERSION_NUMBER)
-void calculate_hash(char *filename, char *output, off_t length)
+/*
+ * Hash the first length bytes of the open file fd, reading with pread() so the
+ * file's position is not touched. The source uses this on the descriptor it
+ * sends from, so the hash is of the file that is sent and not of whatever the
+ * name refers to by then.
+ */
+void calculate_hash_fd(int fd, char *output, off_t length)
 {
 	int n, ok = 0;
 	unsigned int md_len = 0;
@@ -1368,8 +1375,9 @@ void calculate_hash(char *filename, char *output, off_t length)
 	const EVP_MD *md;
 	char buf[HASH_BUFLEN];
 	unsigned char out[EVP_MAX_MD_SIZE];
-	FILE *file_ptr;
-	size_t want, got;
+	size_t want;
+	ssize_t got;
+	off_t off = 0;
 
 	/*
 	 * The protocol carries the hash in a fixed-width field, so the output
@@ -1380,14 +1388,6 @@ void calculate_hash(char *filename, char *output, off_t length)
 	memset(output, '0', HASH_LEN);
 	output[HASH_LEN] = '\0';
 
-	/* open file for calculating hash */
-	file_ptr = fopen(filename, "r");
-	if (file_ptr == NULL) {
-		if (verbose_mode)
-			fprintf(stderr, "%s: error opening file %s\n", hostname, filename);
-		return;
-	}
-
 	if ((md = EVP_get_digestbyname("blake2b512")) == NULL ||
 	    (c = EVP_MD_CTX_new()) == NULL ||
 	    EVP_DigestInit_ex(c, md, NULL) != 1)
@@ -1395,14 +1395,17 @@ void calculate_hash(char *filename, char *output, off_t length)
 
 	while (length > 0) {
 		want = length > HASH_BUFLEN ? HASH_BUFLEN : (size_t)length;
-		got = fread(buf, 1, want, file_ptr);
+		got = pread(fd, buf, want, off);
+		if (got == -1 && errno == EINTR)
+			continue;
 		/* A short read means the file is shorter than requested, or a
 		 * read error. Either way these bytes cannot be hashed. */
-		if (got != want)
+		if (got != (ssize_t)want)
 			goto out;
 		if (EVP_DigestUpdate(c, buf, got) != 1)
 			goto out;
 		length -= got;
+		off += got;
 	}
 	if (EVP_DigestFinal_ex(c, out, &md_len) != 1 ||
 	    md_len * 2 != HASH_LEN)
@@ -1420,15 +1423,36 @@ void calculate_hash(char *filename, char *output, off_t length)
 		output[HASH_LEN] = '\0';
 	}
 	EVP_MD_CTX_free(c);
-	fclose(file_ptr);
+}
+
+void calculate_hash(char *filename, char *output, off_t length)
+{
+	int fd;
+
+	memset(output, '0', HASH_LEN);
+	output[HASH_LEN] = '\0';
+
+	/* open file for calculating hash */
+	if ((fd = open(filename, O_RDONLY)) == -1) {
+		if (verbose_mode)
+			fprintf(stderr, "%s: error opening file %s\n", hostname, filename);
+		return;
+	}
+	calculate_hash_fd(fd, output, length);
+	close(fd);
 }
 #else
-void calculate_hash(char *filename, char *output, off_t length)
+void calculate_hash_fd(int fd, char *output, off_t length)
 {
 	/* Builds without openssl, or with libressl, cannot hash. Keep the
 	 * fixed-width field valid anyway. */
 	memset(output, '0', HASH_LEN);
 	output[HASH_LEN] = '\0';
+}
+
+void calculate_hash(char *filename, char *output, off_t length)
+{
+	calculate_hash_fd(-1, output, length);
 }
 #endif /* WITH_OPENSSL */
 
@@ -1569,7 +1593,7 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 		case S_IFREG:
 			/* only calculate hash if we are in resume mode and a file*/
 			if (resume_flag) {
-				calculate_hash(name, hashsum, stb.st_size);
+				calculate_hash_fd(fd, hashsum, stb.st_size);
 #ifdef DEBUG
 				fprintf(stderr, "%s: Name is '%s' and hash '%s'\n", hostname, name, hashsum);
 				fprintf (stderr,"%s: size of %s is %ld\n", hostname, name, stb.st_size);
@@ -1675,7 +1699,7 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 					fprintf (stderr, "%s: received size of %ld\n", hostname, insize);
 #endif
 					/*get the hash of the source file to the byte length we just got*/
-					calculate_hash(name, test_hashsum, insize);
+					calculate_hash_fd(fd, test_hashsum, insize);
 #ifdef DEBUG
 					fprintf(stderr, "%s: calculated hashsum of local %s to %ld is %s\n",
 						hostname, last, insize, test_hashsum);
@@ -1693,9 +1717,18 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 #ifdef DEBUG
 							fprintf(stderr, "%s: lseek did not return %ld\n", hostname, insize) ;
 #endif
-							goto next;
-						}
-						match = "M";
+							/*
+							 * The sink is waiting for the match status, so
+							 * moving on to the next file here would make
+							 * the next record's first byte the status.
+							 * Say the fragments differ, and send the whole
+							 * file from the start.
+							 */
+							(void) lseek(fd, 0, SEEK_SET);
+							match = "F";
+							xfer_size = stb.st_size;
+						} else
+							match = "M";
 					} else {
 						/* the fragments don't match so we should start over from the begining */
 #ifdef DEBUG
@@ -1707,13 +1740,18 @@ syserr:			run_err("%s: %s", name, strerror(errno));
 					}
 				}
 			}
-			if (*cp == 'S') { /* skip file */
+			/*
+			 * The record's type is its first byte. cp has moved on past
+			 * the hash if this was an R record, and what follows the
+			 * hash is padding, so it is not read as a type.
+			 */
+			if (inbuf[0] == 'S') { /* skip file */
 #ifdef DEBUG
 				fprintf(stderr, "%s: Should be skipping this file\n", hostname);
 #endif
 				goto next;
 			}
-			if (*cp == 'C') { /*transfer entire file*/
+			if (inbuf[0] == 'C') { /*transfer entire file*/
 #ifdef DEBUG
 				fprintf(stderr, "%s: Resending entire file\n", hostname);
 #endif
@@ -1943,6 +1981,92 @@ out:
 	 (sizeof(type) != 4 && sizeof(type) != 8))
 
 
+/*
+ * Read and drop the n bytes of a file the sender is sending, and the NUL that
+ * ends it. See the use in sink().
+ */
+static void
+resume_discard(off_t n)
+{
+	char junk[16384];
+	size_t chunk;
+
+	while (n > 0) {
+		chunk = n > (off_t)sizeof(junk) ? sizeof(junk) : (size_t)n;
+		if (atomicio(read, remin, junk, chunk) != chunk)
+			return;
+		n -= chunk;
+	}
+	(void) atomicio(read, remin, junk, 1);
+}
+
+/*
+ * Append the file "tail", which holds the end of a resumed transfer, to
+ * "orig", which had orig_size bytes before it began, and remove "tail". If the
+ * tail was not written completely (wrerr) or the append fails, put orig back
+ * to the length it had, so that it never holds a partly appended tail.
+ */
+static void
+resume_append(const char *tail, const char *orig, off_t orig_size, int wrerr)
+{
+	FILE *of = NULL, *tf = NULL;
+	char res_buf[512]; /* set at 512 just because, might want to increase*/
+	size_t res_bytes;
+	int cat_ok = 0;
+	struct stat st;
+
+	if (wrerr) {
+		/*
+		 * The tail was not written completely. Appending it would
+		 * corrupt the existing file, so leave that alone. The error
+		 * has already been recorded.
+		 */
+	} else if (stat(orig, &st) == 0 && st.st_size != orig_size) {
+		/*
+		 * The sender checked the first orig_size bytes of this file
+		 * against its own and sent the rest. The file has changed since
+		 * the sink looked at it, so the tail would not belong on it.
+		 */
+		note_err("%s: changed while it was being resumed (%lld bytes, "
+		    "was %lld); the tail was not appended", orig,
+		    (long long)st.st_size, (long long)orig_size);
+	} else if ((of = fopen(orig, "a")) == NULL) {
+		note_err("%s: could not open for appending: %s",
+		    orig, strerror(errno));
+	} else if ((tf = fopen(tail, "r")) == NULL) {
+		note_err("%s: could not open for reading: %s",
+		    tail, strerror(errno));
+	} else {
+		cat_ok = 1;
+		while ((res_bytes = fread(res_buf, 1, sizeof(res_buf),
+		    tf)) > 0) {
+			if (fwrite(res_buf, 1, res_bytes, of) != res_bytes) {
+				note_err("%s: append: %s", orig, strerror(errno));
+				cat_ok = 0;
+				break;
+			}
+		}
+		if (cat_ok && ferror(tf)) {
+			note_err("%s: read: %s", tail, strerror(errno));
+			cat_ok = 0;
+		}
+	}
+	if (tf != NULL)
+		fclose(tf);
+	if (of != NULL && fclose(of) != 0 && cat_ok) {
+		note_err("%s: close: %s", orig, strerror(errno));
+		cat_ok = 0;
+	}
+	if (of != NULL && !cat_ok) {
+		/* put the existing file back to the length it had */
+		if (truncate(orig, orig_size) != 0)
+			note_err("%s: restore: %s", orig, strerror(errno));
+	}
+	/* delete the temporary file */
+	remove(tail);
+}
+
+
 void
 sink(int argc, char **argv, const char *src)
 {
@@ -1964,8 +2088,10 @@ sink(int argc, char **argv, const char *src)
 	char local_hashsum[HASH_LEN+1];
 	char tmpbuf[BUF_AND_HASH];
 	char outbuf[BUF_AND_HASH];
-	char match;
+	char match = 0;
 	int bad_match_flag = 0;
+	int nonreg = 0;	/* resume mode: the target exists and is not a regular file */
+	int oerrno;
 	np = NULL; /* this was originally '/0' but that's wrong */
 	np_tmp = NULL;
 	np_rand = NULL;
@@ -2016,6 +2142,7 @@ sink(int argc, char **argv, const char *src)
 
 	for (first = 1;; first = 0) {
 		bad_match_flag = 0; /* used in resume mode. */
+		nonreg = 0;
 		/*
 		 * Resume state belongs to one file. Release the previous file's
 		 * names here, so that every path through the loop, including the
@@ -2272,6 +2399,12 @@ sink(int argc, char **argv, const char *src)
 #endif
 				npstat.st_size = 0;
 			} else {
+				/*
+				 * A device or a fifo has a size of 0, which would be
+				 * taken for a file to resume and a temporary file
+				 * created beside it. Write to it as it is.
+				 */
+				nonreg = !S_ISREG(npstat.st_mode);
 				/* check to see if the file is writeable
 				 * if it isn't then we need to skip it but
 				 * before we skip it we need to send the remote
@@ -2281,6 +2414,8 @@ sink(int argc, char **argv, const char *src)
 				 * because using a define isn't working */
 				if (access (np, W_OK) != 0) {
 					fprintf(stderr, "scp: %s: Permission denied on %s\n", np, hostname);
+					/* the file was not updated: the exit status says so */
+					++errs;
 					snprintf(outbuf, BUF_AND_HASH, "S%-*s", BUF_AND_HASH-2, " ");
 					(void)atomicio(vwrite, remout, outbuf, strlen(outbuf));
 					(void)atomicio(vwrite, remout, "", 1);
@@ -2293,7 +2428,7 @@ sink(int argc, char **argv, const char *src)
 			 * following block fails. See on 0 byte files the hashes will
 			 * always match and the file won't be created even though it should
 			 */
-			if (xfer_size == npstat.st_size && (npstat.st_size > 0)) {
+			if (!nonreg && xfer_size == npstat.st_size && (npstat.st_size > 0)) {
 				calculate_hash(np, local_hashsum, npstat.st_size);
 				if (strcmp(local_hashsum,remote_hashsum) == 0) {
 					/* we can skip this file if we want to. */
@@ -2327,7 +2462,7 @@ sink(int argc, char **argv, const char *src)
 			}
 			/* if npstat.st_size is 0 then the local file doesn't exist and
 			 * we have to move it. Since we are in resume mode treat it as a resume */
-			if (npstat.st_size < xfer_size || (npstat.st_size == 0)) {
+			if (!nonreg && (npstat.st_size < xfer_size || (npstat.st_size == 0))) {
 				char rand_string[9];
 #ifdef DEBUG
 				fprintf (stderr, "%s: %s is smaller than %s\n", hostname, np, cp);
@@ -2369,7 +2504,7 @@ sink(int argc, char **argv, const char *src)
 				fprintf(stderr, "%s: Will concat %s to %s after xfer\n",
 					hostname, np, np_tmp);
 #endif
-			} else if (npstat.st_size > size) {
+			} else if (nonreg || npstat.st_size > size) {
 			/* the target file is larger than the source.
 			 * so we need to overwrite it. We don't need to send the hash though. */
 #ifdef DEBUG
@@ -2399,7 +2534,8 @@ sink(int argc, char **argv, const char *src)
 
 			/* the remote is always going to send a match status
 			 * so we need to read it so we don't get out of sync */
-			(void) atomicio(read, remin, &match, 1);
+			if (atomicio(read, remin, &match, 1) != 1)
+				SCREWUP("lost connection reading the resume match status");
 			if (match != 'M') {/*fragments do not match*/
 				/* expected response of F, M and NULL *but*
 				 * anything other than M is a failure
@@ -2438,6 +2574,17 @@ sink(int argc, char **argv, const char *src)
 #endif
 		/* the temporary resume file must be new: never follow or reuse an existing name */
 		if ((ofd = open(np, O_WRONLY|O_CREAT|(np == np_rand ? O_EXCL : 0), mode)) == -1) {
+			/*
+			 * In resume mode the reply, the ready byte and the match
+			 * status have all been exchanged by now, so the sender is
+			 * already sending the file. Take its bytes and its closing
+			 * NUL, or they would be read as control records, and then
+			 * report the error in place of the success byte.
+			 */
+			oerrno = errno;
+			if (resume_flag)
+				resume_discard(xfer_size);
+			errno = oerrno;
 bad:			run_err("%s: %s", np, strerror(errno));
 			continue;
 		}
@@ -2483,6 +2630,28 @@ bad:			run_err("%s: %s", np, strerror(errno));
 				j = atomicio6(read, remin, cp, amt,
 				    scpio, &statbytes);
 				if (j == 0) {
+					/*
+					 * In resume mode the bytes so far are the start
+					 * of the tail, in a temporary file. Keep them: write
+					 * what is in the buffer, then append the file to
+					 * the target, so that the next run resumes from
+					 * here. Otherwise they would be sent again, and the
+					 * temporary file left behind.
+					 */
+					if (resume_flag && np_tmp != NULL &&
+					    !bad_match_flag) {
+						size_t have = cp - bp->buf;
+
+						if (!wrerr && have > 0 &&
+						    atomicio(vwrite, ofd, bp->buf,
+						    have) != have)
+							wrerr = 1;
+						if (close(ofd) == -1)
+							wrerr = 1;
+						ofd = -1;
+						resume_append(np, np_tmp,
+						    npstat.st_size, wrerr);
+					}
 					run_err("%s", j != EPIPE ?
 					    strerror(errno) :
 					    "dropped connection");
@@ -2522,10 +2691,6 @@ bad:			run_err("%s: %s", np, strerror(errno));
 			 hostname, resume_flag, np_tmp, bad_match_flag);
 #endif
 		if (resume_flag && np_tmp && !bad_match_flag) {
-			FILE *orig = NULL, *resume = NULL;
-			char res_buf[512]; /* set at 512 just because, might want to increase*/
-			size_t res_bytes;
-			int cat_ok = 0;
 #ifdef DEBUG
 			fprintf(stderr, "%s: Resume flag is set. Going to concat %s to %s  now\n",
 				hostname, np, np_tmp);
@@ -2538,48 +2703,7 @@ bad:			run_err("%s: %s", np, strerror(errno));
 			if (close(ofd) == -1)
 				note_err("%s: close: %s", np, strerror(errno));
 			ofd = -1;
-			if (wrerr) {
-				/*
-				 * The tail was not written completely. Appending it would
-				 * corrupt the existing file, so leave that alone. The error
-				 * has already been recorded.
-				 */
-			} else if ((orig = fopen(np_tmp, "a")) == NULL) {
-				note_err("%s: could not open for appending: %s",
-				    np_tmp, strerror(errno));
-			} else if ((resume = fopen(np, "r")) == NULL) {
-				note_err("%s: could not open for reading: %s",
-				    np, strerror(errno));
-			} else {
-				cat_ok = 1;
-				while ((res_bytes = fread(res_buf, 1, sizeof(res_buf),
-				    resume)) > 0) {
-					if (fwrite(res_buf, 1, res_bytes, orig) != res_bytes) {
-						note_err("%s: append: %s", np_tmp,
-						    strerror(errno));
-						cat_ok = 0;
-						break;
-					}
-				}
-				if (cat_ok && ferror(resume)) {
-					note_err("%s: read: %s", np, strerror(errno));
-					cat_ok = 0;
-				}
-			}
-			if (resume != NULL)
-				fclose(resume);
-			if (orig != NULL && fclose(orig) != 0 && cat_ok) {
-				note_err("%s: close: %s", np_tmp, strerror(errno));
-				cat_ok = 0;
-			}
-			if (orig != NULL && !cat_ok) {
-				/* put the existing file back to the length it had */
-				if (truncate(np_tmp, npstat.st_size) != 0)
-					note_err("%s: restore: %s", np_tmp,
-					    strerror(errno));
-			}
-			/* delete the temporary file */
-			remove(np);
+			resume_append(np, np_tmp, npstat.st_size, wrerr);
 #ifdef DEBUG
 			fprintf (stderr, "%s: np(%s) and np_tmp(%s)\n", hostname, np, np_tmp);
 #endif

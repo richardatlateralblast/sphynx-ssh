@@ -154,11 +154,14 @@ cipher_alg_list(char sep, int auth_only)
 const char *
 compression_alg_list(int compression)
 {
+	/* huff0@hpnssh.org needs no library; zlib does */
 #ifdef WITH_ZLIB
-	return compression ? "zlib@openssh.com,none" :
-	    "none,zlib@openssh.com";
+	return compression ?
+	    "huff0@hpnssh.org,zlib@openssh.com,none" :
+	    "none,zlib@openssh.com,huff0@hpnssh.org";
 #else
-	return "none";
+	return compression ? "huff0@hpnssh.org,none" :
+	    "none,huff0@hpnssh.org";
 #endif
 }
 
@@ -383,35 +386,41 @@ cipher_init(struct sshcipher_ctx **ccp, const struct sshcipher *cipher,
 	 * _meth_new process found in cipher-ctr-mt.c */
 	if (strstr(cc->cipher->name, "ctr") && enable_threads) {
 #ifdef WITH_OPENSSL3
-		/* this version of openssl uses providers */
-		OSSL_LIB_CTX *aes_lib = NULL; /* probably not needed */
-		OSSL_PROVIDER *aes_mt_provider = NULL;
+		/* this version of openssl uses providers. The provider is
+		 * added and loaded, and each cipher fetched, once for the
+		 * life of the process: doing it on every init, as this used
+		 * to, took a new reference to each and never gave it back */
+		static OSSL_PROVIDER *aes_mt_provider = NULL;
+		static EVP_CIPHER *aes_mt_fetched[3]; /* 128, 192 and 256 bit */
+		const char *aes_mt_names[3] = { "aes_ctr_mt_128",
+		    "aes_ctr_mt_192", "aes_ctr_mt_256" };
+		int ki = cipher->key_len == 16 ? 0 :
+		    cipher->key_len == 24 ? 1 : cipher->key_len == 32 ? 2 : -1;
 		type = NULL;
 
-		if (OSSL_PROVIDER_add_builtin(aes_lib, "hpnssh",
-					      OSSL_provider_init) != 1) {
-			fatal("Failed to add HPNSSH provider for AES-CTR");
-		}
-		aes_mt_provider = OSSL_PROVIDER_load(aes_lib, "hpnssh");
-
-		if (aes_mt_provider != NULL) {
-			/* use the previous key length to determine which cipher to load */
-			if (cipher->key_len == 32)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_256", NULL);
-			if (cipher->key_len == 24)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_192", NULL);
-			if (cipher->key_len == 16)
-				type = EVP_CIPHER_fetch(aes_lib, "aes_ctr_mt_128", NULL);
-			if (type == NULL) {
+		if (aes_mt_provider == NULL) {
+			if (OSSL_PROVIDER_add_builtin(NULL, "hpnssh",
+			    OSSL_provider_init) != 1) {
+				fatal("Failed to add HPNSSH provider for AES-CTR");
+			}
+			if ((aes_mt_provider = OSSL_PROVIDER_load(NULL,
+			    "hpnssh")) == NULL) {
 				ERR_print_errors_fp(stderr);
-				fatal("FAILED TO LOAD aes_ctr_mt");
-			} else {
-				debug("LOADED aes_ctr_mt");
+				fatal("Failed to load HPN-SSH AES-CTR-MT provider.");
 			}
 		}
-		else {
+		/* use the key length to determine which cipher to load */
+		if (ki >= 0) {
+			if (aes_mt_fetched[ki] == NULL)
+				aes_mt_fetched[ki] = EVP_CIPHER_fetch(NULL,
+				    aes_mt_names[ki], NULL);
+			type = aes_mt_fetched[ki];
+		}
+		if (type == NULL) {
 			ERR_print_errors_fp(stderr);
-			fatal("Failed to load HPN-SSH AES-CTR-MT provider.");
+			fatal("FAILED TO LOAD aes_ctr_mt");
+		} else {
+			debug("LOADED aes_ctr_mt");
 		}
 #else
 		type = (*evp_aes_ctr_mt)(); /* see cipher-ctr-mt.c */

@@ -41,6 +41,9 @@ struct ssh;
 
 /* Client side main loop for the interactive session. */
 int	 client_loop(struct ssh *, int, int, int);
+/* run a prompt or a child with the signals the loop blocks unblocked; see clientloop.c */
+int	 client_sigmask_begin(sigset_t *);
+void	 client_sigmask_end(int, const sigset_t *);
 int	 client_x11_get_proto(struct ssh *, const char *, const char *,
 	    u_int, u_int, char **, char **);
 void	 client_session2_setup(struct ssh *, int, int, int,
